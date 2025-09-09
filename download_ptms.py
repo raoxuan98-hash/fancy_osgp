@@ -16,3 +16,4 @@ snapshot_download(
     local_dir_use_symlinks=False,             # 避免符号链接（可选）
     tqdm=True                                # 显示进度条
 )
+print('1')
