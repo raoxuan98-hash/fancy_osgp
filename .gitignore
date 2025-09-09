@@ -10,6 +10,7 @@ ZSCL零样本评估demo/
 .history/
 SubspaceLoRA_ZSCL_seperation/
 pretrained_models/
+moco
 
 # 忽略所有 .zip 和 .csv 文件
 *.zip
@@ -17,6 +18,9 @@ pretrained_models/
 *.sh
 *.png
 *.ipynb
+*.pt
+*.pth
+*.out
 
 # 不忽略 data.zip（例外）
 !data.zip
