@@ -1,0 +1,30 @@
+# 忽略数据集目录
+data/
+dataset/
+cached_data/
+clip_datasets/
+optuna/
+sldc_logs_raoxuan/
+sldc_logs_simian_domainnet/
+ZSCL零样本评估demo/
+.history/
+SubspaceLoRA_ZSCL_seperation/
+pretrained_models/
+
+# 忽略所有 .zip 和 .csv 文件
+*.zip
+*.csv
+*.sh
+*.png
+*.ipynb
+
+# 不忽略 data.zip（例外）
+!data.zip
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略敏感配置
+.env
+secrets.yaml
