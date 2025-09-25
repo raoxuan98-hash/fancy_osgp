@@ -2,7 +2,6 @@
 data/
 dataset/
 cached_data/
-clip_datasets/
 optuna/
 sldc_logs_raoxuan/
 sldc_logs_simian_domainnet/
