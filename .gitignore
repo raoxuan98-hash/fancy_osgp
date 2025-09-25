@@ -11,6 +11,7 @@ ZSCL零样本评估demo/
 SubspaceLoRA_ZSCL_seperation/
 pretrained_models/
 moco
+x_tail_data/
 
 # 忽略所有 .zip 和 .csv 文件
 *.zip
