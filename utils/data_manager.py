@@ -1,16 +1,17 @@
 import logging
+import os
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR100_224, iImageNetR, iCUB200_224, iResisc45_224, iCARS196_224, iSketch345_224,iDomainNet
+from datasets import create_dataset
 from copy import deepcopy
 import random
 from utils.toolkit import write_domain_img_file2txt, split_domain_txt2txt
 
 
 class DataManager(object):
-    def __init__(self, dataset_name, shuffle, seed, init_cls, increment,args=None):
+    def __init__(self, dataset_name, shuffle, seed, init_cls, increment, args=None):
         self.dataset_name = dataset_name
         self.args = args
         self.init_cls = init_cls
@@ -130,53 +131,57 @@ class DataManager(object):
         args_for_idata.setdefault('init_cls', self.init_cls)
         args_for_idata.setdefault('increment', self.increment)
         args_for_idata.setdefault('seed', seed)
+
+        data_path = args_for_idata.get('data_path', './data')
+        args_for_idata.setdefault('data_path', data_path)
         logging.info(f"[DataManager] args_for_idata = {args_for_idata}")
 
-        # 如果用户没指定 total_sessions，使用 task_name 的长度（若 task_name 存在），否则使用 6（DomainNet 默认）
         if 'total_sessions' not in args_for_idata:
-            args_for_idata['total_sessions'] = len(args_for_idata.get('task_name')) if args_for_idata.get('task_name') else 6
+            task_names = args_for_idata.get('task_name')
+            args_for_idata['total_sessions'] = len(task_names) if task_names else 6
 
-        # 如果是 domainnet：确保所需的 train/test txt 存在
         name = dataset_name.lower()
         if name == 'domainnet':
-            if 'data_path' not in args_for_idata:
-                raise RuntimeError("domainnet requires args['data_path'] pointing to the root directory containing domain txt or image folders. Please provide it.")
             image_list_root = args_for_idata['data_path']
+            if not os.path.isdir(image_list_root):
+                raise RuntimeError(
+                    f"DomainNet data_path '{image_list_root}' does not exist."
+                )
             domain_names = args_for_idata.get('task_name') or ["clipart", "infograph", "painting", "quickdraw", "real", "sketch"]
             for d in domain_names:
                 write_domain_img_file2txt(image_list_root, d)
-                split_domain_txt2txt(image_list_root, d, train_ratio=args_for_idata.get('train_ratio', 0.7),
-                                     seed=args_for_idata.get('seed', seed))
+                split_domain_txt2txt(
+                    image_list_root,
+                    d,
+                    train_ratio=args_for_idata.get('train_ratio', 0.7),
+                    seed=args_for_idata.get('seed', seed),
+                )
 
-        
-        
-        
-        
-        idata = _get_idata(dataset_name,args_for_idata)
-        idata.download_data()
+        dataset_kwargs = dict(args_for_idata)
+        dataset_kwargs.pop('data_path', None)
+        idata = create_dataset(dataset_name, data_path, **dataset_kwargs)
+        contents = idata.ensure_loaded()
 
-        # Data
-        self._train_data, self._train_targets = idata.train_data, idata.train_targets
-        self._test_data, self._test_targets = idata.test_data, idata.test_targets
+        self.dataset = idata
+        self.classnames = idata.classnames
+        self.templates = idata.templates
+
+        self._train_data, self._train_targets = contents.train_data, contents.train_targets
+        self._test_data, self._test_targets = contents.test_data, contents.test_targets
         self.use_path = idata.use_path
 
-        # Transforms
         self._train_trsf = idata.train_trsf
         self._test_trsf = idata.test_trsf
         self._common_trsf = idata.common_trsf
 
-        # Order
-        order = [i for i in range(len(np.unique(self._train_targets)))]
         if shuffle:
             np.random.seed(seed)
-            order = np.random.permutation(len(order)).tolist()
+            order = np.random.permutation(len(np.unique(self._train_targets))).tolist()
         else:
-            order = idata.class_order
+            order = list(idata.infer_class_order())
         self._class_order = order
         logging.info(self._class_order)
-        print(self._class_order)
 
-        # Map indices
         self._train_targets = _map_new_class_index(self._train_targets, self._class_order)
         self._test_targets = _map_new_class_index(self._test_targets, self._class_order)
 
@@ -226,34 +231,6 @@ class DummyDataset(Dataset):
 
 def _map_new_class_index(y, order):
     return np.array(list(map(lambda x: order.index(x), y)))
-
-
-def _get_idata(dataset_name, args=None):
-    name = dataset_name.lower()
-    if name == 'cifar10':
-        return iCIFAR10()
-    elif name == 'cifar100':
-        return iCIFAR100()
-    elif name == 'cifar100_224':
-        return iCIFAR100_224()
-    elif name == 'imagenet1000':
-        return iImageNet1000()
-    elif name == "imagenet100":
-        return iImageNet100()
-    elif name == "imagenet-r":
-        return iImageNetR()
-    elif name == 'cub200_224':
-        return iCUB200_224()
-    elif name == 'resisc45':
-        return iResisc45_224()
-    elif name == 'cars196_224':
-        return iCARS196_224()
-    elif name == 'sketch345_224':
-        return iSketch345_224()
-    elif name == 'domainnet':
-        return iDomainNet(args)
-    else:
-        raise NotImplementedError('Unknown dataset {}.'.format(dataset_name))
 
 
 def pil_loader(path):
