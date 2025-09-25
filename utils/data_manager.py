@@ -1,294 +1,153 @@
 import logging
+from typing import Iterable, List, Sequence
+
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR100_224, iImageNetR, iCUB200_224, iResisc45_224, iCARS196_224, iSketch345_224,iDomainNet
-from copy import deepcopy
-import random
-from utils.toolkit import write_domain_img_file2txt, split_domain_txt2txt
+
+from utils.data import (
+    iCARS196_224,
+    iCIFAR100_224,
+    iCUB200_224,
+    iDomainNet,
+    iImageNetR,
+    iResisc45_224,
+)
 
 
-class DataManager(object):
-    def __init__(self, dataset_name, shuffle, seed, init_cls, increment,args=None):
+class DataManager:
+    """Lightweight data manager tailored to the datasets used in this project."""
+
+    def __init__(self, dataset_name, shuffle, seed, init_cls, increment, args=None):
         self.dataset_name = dataset_name
-        self.args = args
+        self.args = args or {}
         self.init_cls = init_cls
         self.increment = increment
         self.seed = seed
-        
-        self._setup_data(dataset_name, shuffle, seed)
-        assert init_cls <= len(self._class_order), 'No enough classes.'
-        self._increments = [init_cls]
-        
-         # 如果用户显式提供 args 且其中包含 total_sessions，优先使用
-        if self.args is not None and "total_sessions" in self.args:
-            nb_tasks = int(self.args["total_sessions"])
-            for _ in range(nb_tasks - 1):
-                self._increments.append(increment)
-        else:
-            # 原有逻辑（按 increment 填充直到覆盖所有类）
-            while sum(self._increments) + increment < len(self._class_order):
-                self._increments.append(increment)
-            offset = len(self._class_order) - sum(self._increments)
-            if offset > 0:
-                self._increments.append(offset)
-        
-        
-    
+
+        self._setup_data(shuffle, seed)
+        assert init_cls <= len(self._class_order), "No enough classes."
+        self._increments = self._build_task_schedule()
 
     @property
-    def nb_tasks(self):  
+    def nb_tasks(self) -> int:
         return len(self._increments)
 
-    def get_task_size(self, task):
+    def get_task_size(self, task: int) -> int:
         return self._increments[task]
 
-    def get_dataset(self, indices, source, mode, appendent=None, ret_data=False, with_raw=False, with_noise=False):
-        if source == 'train':
-            x, y = self._train_data, self._train_targets
-        elif source == 'test':
-            x, y = self._test_data, self._test_targets
-        else:
-            raise ValueError('Unknown data source {}.'.format(source))
+    def get_dataset(self, class_indices: Iterable[int], source: str, mode: str):
+        data, targets = self._select(source, class_indices)
+        transform = self._build_transform(mode)
+        return DummyDataset(data, targets, transform, self.use_path)
 
-        if mode == 'train':
-            trsf = transforms.Compose([*self._train_trsf, *self._common_trsf])
-        elif mode == 'flip':
-            trsf = transforms.Compose([*self._test_trsf, transforms.RandomHorizontalFlip(p=1.), *self._common_trsf])
-        elif mode == 'test':
-            trsf = transforms.Compose([*self._test_trsf, *self._common_trsf])
-        else:
-            raise ValueError('Unknown mode {}.'.format(mode))
+    # ---------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------
+    def _setup_data(self, shuffle: bool, seed: int) -> None:
+        idata_args = dict(self.args)
+        idata_args.setdefault("init_cls", self.init_cls)
+        idata_args.setdefault("increment", self.increment)
+        idata_args.setdefault("seed", seed)
+        logging.info("[DataManager] args_for_idata = %s", idata_args)
 
-        data, targets = [], []
-        
-        for idx in indices:
-            class_data, class_targets = self._select(x, y, low_range=idx, high_range=idx+1)
-            data.append(class_data)
-            targets.append(class_targets)
-
-        if appendent is not None and len(appendent) != 0:
-            appendent_data, appendent_targets = appendent
-            data.append(appendent_data)
-            targets.append(appendent_targets)
-
-        data, targets = np.concatenate(data), np.concatenate(targets)
-
-        if ret_data:
-            return data, targets, DummyDataset(data, targets, trsf, self.use_path, with_raw, with_noise)
-        else:
-            return DummyDataset(data, targets, trsf, self.use_path, with_raw, with_noise)
-
-    def get_dataset_with_split(self, indices, source, mode, appendent=None, val_samples_per_class=0):
-        if source == 'train':
-            x, y = self._train_data, self._train_targets
-        elif source == 'test':
-            x, y = self._test_data, self._test_targets
-        else:
-            raise ValueError('Unknown data source {}.'.format(source))
-
-        if mode == 'train':
-            trsf = transforms.Compose([*self._train_trsf, *self._common_trsf])
-        elif mode == 'test':
-            trsf = transforms.Compose([*self._test_trsf, *self._common_trsf])
-        else:
-            raise ValueError('Unknown mode {}.'.format(mode))
-
-        train_data, train_targets = [], []
-        val_data, val_targets = [], []
-        for idx in indices:
-            class_data, class_targets = self._select(x, y, low_range=idx, high_range=idx+1)
-            val_indx = np.random.choice(len(class_data), val_samples_per_class, replace=False)
-            train_indx = list(set(np.arange(len(class_data))) - set(val_indx))
-            val_data.append(class_data[val_indx])
-            val_targets.append(class_targets[val_indx])
-            train_data.append(class_data[train_indx])
-            train_targets.append(class_targets[train_indx])
-
-        if appendent is not None:
-            appendent_data, appendent_targets = appendent
-            for idx in range(0, int(np.max(appendent_targets))+1):
-                append_data, append_targets = self._select(appendent_data, appendent_targets,
-                                                           low_range=idx, high_range=idx+1)
-                val_indx = np.random.choice(len(append_data), val_samples_per_class, replace=False)
-                train_indx = list(set(np.arange(len(append_data))) - set(val_indx))
-                val_data.append(append_data[val_indx])
-                val_targets.append(append_targets[val_indx])
-                train_data.append(append_data[train_indx])
-                train_targets.append(append_targets[train_indx])
-
-        train_data, train_targets = np.concatenate(train_data), np.concatenate(train_targets)
-        val_data, val_targets = np.concatenate(val_data), np.concatenate(val_targets)
-
-        return DummyDataset(train_data, train_targets, trsf, self.use_path), \
-            DummyDataset(val_data, val_targets, trsf, self.use_path)
-
-    def _setup_data(self, dataset_name, shuffle, seed):
-        
-        args_for_idata = dict(self.args) if self.args else {}
-        args_for_idata.setdefault('init_cls', self.init_cls)
-        args_for_idata.setdefault('increment', self.increment)
-        args_for_idata.setdefault('seed', seed)
-        logging.info(f"[DataManager] args_for_idata = {args_for_idata}")
-
-        # 如果用户没指定 total_sessions，使用 task_name 的长度（若 task_name 存在），否则使用 6（DomainNet 默认）
-        if 'total_sessions' not in args_for_idata:
-            args_for_idata['total_sessions'] = len(args_for_idata.get('task_name')) if args_for_idata.get('task_name') else 6
-
-        # 如果是 domainnet：确保所需的 train/test txt 存在
-        name = dataset_name.lower()
-        if name == 'domainnet':
-            if 'data_path' not in args_for_idata:
-                raise RuntimeError("domainnet requires args['data_path'] pointing to the root directory containing domain txt or image folders. Please provide it.")
-            image_list_root = args_for_idata['data_path']
-            domain_names = args_for_idata.get('task_name') or ["clipart", "infograph", "painting", "quickdraw", "real", "sketch"]
-            for d in domain_names:
-                write_domain_img_file2txt(image_list_root, d)
-                split_domain_txt2txt(image_list_root, d, train_ratio=args_for_idata.get('train_ratio', 0.7),
-                                     seed=args_for_idata.get('seed', seed))
-
-        
-        
-        
-        
-        idata = _get_idata(dataset_name,args_for_idata)
+        idata = _get_idata(self.dataset_name, idata_args)
         idata.download_data()
 
-        # Data
         self._train_data, self._train_targets = idata.train_data, idata.train_targets
         self._test_data, self._test_targets = idata.test_data, idata.test_targets
         self.use_path = idata.use_path
-
-        # Transforms
         self._train_trsf = idata.train_trsf
         self._test_trsf = idata.test_trsf
         self._common_trsf = idata.common_trsf
 
-        # Order
-        order = [i for i in range(len(np.unique(self._train_targets)))]
+        unique_targets = np.unique(self._train_targets)
         if shuffle:
-            np.random.seed(seed)
-            order = np.random.permutation(len(order)).tolist()
+            rng = np.random.RandomState(seed)
+            class_order = rng.permutation(unique_targets).tolist()
         else:
-            order = idata.class_order
-        self._class_order = order
-        logging.info(self._class_order)
-        print(self._class_order)
+            class_order = (
+                list(idata.class_order)
+                if idata.class_order is not None
+                else unique_targets.tolist()
+            )
+        self._class_order = class_order
+        logging.info("Class order: %s", self._class_order)
 
-        # Map indices
-        self._train_targets = _map_new_class_index(self._train_targets, self._class_order)
-        self._test_targets = _map_new_class_index(self._test_targets, self._class_order)
+        mapping = {orig: idx for idx, orig in enumerate(self._class_order)}
+        self._train_targets = np.array([mapping[int(y)] for y in self._train_targets])
+        self._test_targets = np.array([mapping[int(y)] for y in self._test_targets])
 
-    def _select(self, x, y, low_range, high_range):
-        idxes = np.where(np.logical_and(y >= low_range, y < high_range))[0]
-        return x[idxes], y[idxes]
+    def _build_task_schedule(self) -> List[int]:
+        total_classes = len(self._class_order)
+        increments = [self.init_cls]
+        remaining = total_classes - self.init_cls
+        while remaining > 0:
+            step = min(self.increment, remaining)
+            increments.append(step)
+            remaining -= step
+        return increments
+
+    def _build_transform(self, mode: str) -> transforms.Compose:
+        if mode == "train":
+            ops = [*self._train_trsf, *self._common_trsf]
+        elif mode == "test":
+            ops = [*self._test_trsf, *self._common_trsf]
+        else:
+            raise ValueError(f"Unknown mode {mode}.")
+        return transforms.Compose(ops)
+
+    def _select(self, source: str, class_indices: Sequence[int]):
+        if source == "train":
+            data, targets = self._train_data, self._train_targets
+        elif source == "test":
+            data, targets = self._test_data, self._test_targets
+        else:
+            raise ValueError(f"Unknown data source {source}.")
+
+        mask = np.isin(targets, class_indices)
+        return data[mask], targets[mask]
 
 
 class DummyDataset(Dataset):
-    def __init__(self, images, labels, trsf, use_path=False, with_raw=False, with_noise=False):
-        assert len(images) == len(labels), 'Data size error!'
+    def __init__(self, images, labels, transform, use_path=False):
+        assert len(images) == len(labels), "Data size error!"
         self.images = images
         self.labels = labels
-        self.trsf = trsf
+        self.transform = transform
         self.use_path = use_path
-        self.with_raw = with_raw
-        if use_path and with_raw:
-            self.raw_trsf = transforms.Compose([transforms.Resize((500, 500)), transforms.ToTensor()])
-        else:
-            self.raw_trsf = transforms.Compose([transforms.ToTensor()])
-        if with_noise:
-            class_list = np.unique(self.labels)
-            self.ori_labels = deepcopy(labels)
-            for cls in class_list:
-                random_target = class_list.tolist()
-                random_target.remove(cls)
-                tindx = [i for i, x in enumerate(self.ori_labels) if x == cls]
-                for i in tindx[:round(len(tindx)*0.2)]:
-                    self.labels[i] = random.choice(random_target)
-            
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         if self.use_path:
-            load_image = pil_loader(self.images[idx])
-            image = self.trsf(load_image)
+            image = pil_loader(self.images[idx])
         else:
-            load_image = Image.fromarray(self.images[idx])
-            image = self.trsf(load_image)
-        label = self.labels[idx]
-        if self.with_raw:
-            return idx, image, label, self.raw_trsf(load_image) 
-        return idx, image, label
+            image = Image.fromarray(self.images[idx])
+        image = self.transform(image)
+        return idx, image, self.labels[idx]
 
 
-def _map_new_class_index(y, order):
-    return np.array(list(map(lambda x: order.index(x), y)))
-
-
-def _get_idata(dataset_name, args=None):
+def _get_idata(dataset_name: str, args=None):
     name = dataset_name.lower()
-    if name == 'cifar10':
-        return iCIFAR10()
-    elif name == 'cifar100':
-        return iCIFAR100()
-    elif name == 'cifar100_224':
+    if name == "cifar100_224":
         return iCIFAR100_224()
-    elif name == 'imagenet1000':
-        return iImageNet1000()
-    elif name == "imagenet100":
-        return iImageNet100()
-    elif name == "imagenet-r":
+    if name == "imagenet-r":
         return iImageNetR()
-    elif name == 'cub200_224':
+    if name == "cub200_224":
         return iCUB200_224()
-    elif name == 'resisc45':
-        return iResisc45_224()
-    elif name == 'cars196_224':
+    if name == "cars196_224":
         return iCARS196_224()
-    elif name == 'sketch345_224':
-        return iSketch345_224()
-    elif name == 'domainnet':
-        return iDomainNet(args)
-    else:
-        raise NotImplementedError('Unknown dataset {}.'.format(dataset_name))
+    if name == "resisc45_224":
+        return iResisc45_224()
+    if name == "domainnet":
+        return iDomainNet(args or {})
+    raise NotImplementedError(f"Unknown dataset {dataset_name}.")
 
 
 def pil_loader(path):
-    '''
-    Ref:
-    https://pytorch.org/docs/stable/_modules/torchvision/datasets/folder.html#ImageFolder
-    '''
-    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         img = Image.open(f)
-        return img.convert('RGB')
-
-
-def accimage_loader(path):
-    '''
-    Ref:
-    https://pytorch.org/docs/stable/_modules/torchvision/datasets/folder.html#ImageFolder
-    accimage is an accelerated Image loader and preprocessor leveraging Intel IPP.
-    accimage is available on conda-forge.
-    '''
-    import accimage
-    try:
-        return accimage.Image(path)
-    except IOError:
-        # Potentially a decoding problem, fall back to PIL.Image
-        return pil_loader(path)
-
-
-def default_loader(path):
-    '''
-    Ref:
-    https://pytorch.org/docs/stable/_modules/torchvision/datasets/folder.html#ImageFolder
-    '''
-    from torchvision import get_image_backend
-    if get_image_backend() == 'accimage':
-        return accimage_loader(path)
-    else:
-        return pil_loader(path)
+        return img.convert("RGB")
