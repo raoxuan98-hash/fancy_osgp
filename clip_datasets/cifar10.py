@@ -7,26 +7,9 @@ from torchvision.datasets import CIFAR10 as PyTorchCIFAR10
 from torchvision.datasets import CIFAR100 as PyTorchCIFAR100
 from torchvision.datasets import VisionDataset
 
-cifar10_template = [
-    lambda c : f'a photo of a {c}.',
-    lambda c : f'a blurry photo of a {c}.',
-    lambda c : f'a black and white photo of a {c}.',
-    lambda c : f'a low contrast photo of a {c}.',
-    lambda c : f'a high contrast photo of a {c}.',
-    lambda c : f'a bad photo of a {c}.',
-    lambda c : f'a good photo of a {c}.',
-    lambda c : f'a photo of a small {c}.',
-    lambda c : f'a photo of a big {c}.',
-    lambda c : f'a photo of the {c}.',
-    lambda c : f'a blurry photo of the {c}.',
-    lambda c : f'a black and white photo of the {c}.',
-    lambda c : f'a low contrast photo of the {c}.',
-    lambda c : f'a high contrast photo of the {c}.',
-    lambda c : f'a bad photo of the {c}.',
-    lambda c : f'a good photo of the {c}.',
-    lambda c : f'a photo of the small {c}.',
-    lambda c : f'a photo of the big {c}.',
-]
+from datasets.prompts import build_cifar_template
+
+cifar10_template = build_cifar_template()
 
 
 DOWNLOAD = True
