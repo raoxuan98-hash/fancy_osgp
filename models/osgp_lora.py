@@ -265,8 +265,8 @@ class BaseLoRAViT(nn.Module):
             fc1_in = blk.mlp.fc1.in_features
             fc1_dtype = blk.mlp.fc1.weight.dtype
 
-            # fc2_in = blk.mlp.fc2.in_features
-            # fc2_dtype = blk.mlp.fc2.weight.dtype
+            fc2_in = blk.mlp.fc2.in_features
+            fc2_dtype = blk.mlp.fc2.weight.dtype
 
             # 根据工厂决定占位投影
             def make_placeholder(d, dtype):
@@ -287,11 +287,11 @@ class BaseLoRAViT(nn.Module):
             blk.mlp.fc1 = new_fc1
             self.lora_modules[f"block_{idx}_mlp_fc1"] = new_fc1
 
-            # # ---- MLP fc1 ----
-            # fc2_proj = make_placeholder(fc2_in, fc2_dtype)
-            # new_fc2 = linear_adapter_cls(blk.mlp.fc2, r, fc2_proj)
-            # blk.mlp.fc2 = new_fc2
-            # self.lora_modules[f"block_{idx}_mlp_fc2"] = new_fc2
+            # ---- MLP fc1 ----
+            fc2_proj = make_placeholder(fc2_in, fc2_dtype)
+            new_fc2 = linear_adapter_cls(blk.mlp.fc2, r, fc2_proj)
+            blk.mlp.fc2 = new_fc2
+            self.lora_modules[f"block_{idx}_mlp_fc2"] = new_fc2
 
 
         self.lora_vit = vit_model
@@ -301,8 +301,10 @@ class BaseLoRAViT(nn.Module):
         for _, module in self.lora_modules.items():
             if isinstance(module, (OSGPQKV, SGPQKV)):
                 W = module.qkv.weight
-            else:
+            elif isinstance(module, (OSGPLinear, SGPLinear)):
                 W = module.linear.weight
+            else:
+                continue  # 安全跳过未知类型
             _, _, Vh = torch.linalg.svd(W, full_matrices=False)
             module.A.data = Vh[: self.r, :].clone()
             module.B.data.zero_()
@@ -343,6 +345,12 @@ class BaseLoRAViT(nn.Module):
                 if name_fc1 in self.lora_modules:
                     adapter = self.lora_modules[name_fc1]
                     blk.mlp.fc1 = adapter.linear
+
+                # ---- MLP fc2 ----
+                name_fc2 = f"block_{idx}_mlp_fc2"
+                if name_fc2 in self.lora_modules:
+                    adapter = self.lora_modules[name_fc2]
+                    blk.mlp.fc2 = adapter.linear
 
             self.lora_modules = nn.ModuleDict()
 
@@ -551,10 +559,10 @@ def build_projection(
         # print(weights)
 
         # --- 归一化熵缩放，与原版保持一致 ---
-        prob = eigvals / eigvals.sum()
-        entropy = -torch.sum((prob + 1e-7) * torch.log(prob + 1e-7))
-        max_entropy = math.log(d)
-        normalized_entropy = (max_entropy - entropy) / max_entropy
+        # prob = eigvals / eigvals.sum()
+        # entropy = -torch.sum((prob + 1e-7) * torch.log(prob + 1e-7))
+        # max_entropy = math.log(d)
+        # normalized_entropy = (max_entropy - entropy) / max_entropy
 
         # total = eigvals.sum()
         # cumsum = torch.cumsum(eigvals, dim=0)
@@ -563,8 +571,7 @@ def build_projection(
         # m = idx[0].item() if idx.numel() > 0 else eigvals.numel()
         # normalized_entropy = m / d
         # print(normalized_entropy)
-
-        diag_w = torch.diag(weights) * k * normalized_entropy
+        diag_w = torch.diag(weights) * k #* normalized_entropy
         P = eigvecs @ diag_w @ eigvecs.t()
 
     else:

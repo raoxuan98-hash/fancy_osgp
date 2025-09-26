@@ -1,162 +1,253 @@
-import torch
-import torch.nn.functional as F
+# -*- coding: utf-8 -*-
 import math
-import torch.nn as nn
 import copy
-from torchvision import datasets, transforms
 import numpy as np
-from torch.utils.data import DataLoader, Subset
+from typing import Dict
 
-def cholesky_manual_parallel(matrix):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+from sklearn.cluster import KMeans
+from torch.utils.data import DataLoader, TensorDataset
+
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
+def cholesky_manual_stable(matrix: torch.Tensor, reg: float = 1e-5) -> torch.Tensor:
+    """稳定的手动 Cholesky 分解，自动添加正则化 (matrix must be SPD-ish)"""
     n = matrix.size(0)
     L = torch.zeros_like(matrix)
+    reg_eye = reg * torch.eye(n, device=matrix.device, dtype=matrix.dtype)
+    matrix = matrix + reg_eye
+
     for j in range(n):
         s_diag = torch.sum(L[j, :j] ** 2, dim=0)
         diag = matrix[j, j] - s_diag
         L[j, j] = torch.sqrt(torch.clamp(diag, min=1e-8))
+
         if j < n - 1:
-            s_off = torch.mm(L[j+1:, :j], L[j, :j].unsqueeze(1)).squeeze(1)
-            L[j+1:, j] = (matrix[j+1:, j] - s_off) / L[j, j]
+            s_off = L[j + 1:, :j] @ L[j, :j]
+            L[j + 1:, j] = (matrix[j + 1:, j] - s_off) / L[j, j]
     return L
 
-def sample_torch_cholesky(n_samples, mean, L, given_Z=None):
-    if given_Z is not None:
-        random_indices = torch.randperm(given_Z.shape[0] )
-        Z = given_Z[random_indices][0:n_samples].to(mean.device)
-    else:
-        Z = torch.randn(n_samples, mean.size(0), device=mean.device)
-    X = Z @ L.T + mean.unsqueeze(0)
-    return X
 
-def symmetric_cross_entropy_loss(logits, targets, sce_a=0.5, sce_b=0.5):
+def symmetric_cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor,
+                                 sce_a: float = 0.5, sce_b: float = 0.5) -> torch.Tensor:
+    """对称交叉熵损失：CE + RCE"""
     pred = F.softmax(logits, dim=1)
-    pred = torch.clamp(pred, min=1e-7, max=1.0) 
-    label_one_hot = torch.nn.functional.one_hot(targets, pred.size(1)).float().to(pred.device)
-    label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0)
-    ce_loss = -torch.sum(label_one_hot * torch.log(pred), dim=1).mean()
-    rce_loss = -torch.sum(pred * torch.log(label_one_hot), dim=1).mean()
-    total_loss = sce_a * ce_loss + sce_b * rce_loss
-    return total_loss
+    pred = torch.clamp(pred, min=1e-7, max=1.0)
 
+    label_one_hot = F.one_hot(targets, num_classes=pred.size(1)).float().to(pred.device)
+    label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0)
+
+    ce_loss = -(label_one_hot * torch.log(pred)).sum(dim=1).mean()
+    rce_loss = -(pred * torch.log(label_one_hot)).sum(dim=1).mean()
+
+    return sce_a * ce_loss + sce_b * rce_loss
+
+
+# -----------------------------------------------------------------------------
+# Statistics containers
+# -----------------------------------------------------------------------------
 class GaussianStatistics:
-    def __init__(self, mean, cov):
+    """单均值高斯：mean 为 (D,)，cov 为 (D, D)"""
+
+    def __init__(self, mean: torch.Tensor, cov: torch.Tensor, reg: float = 1e-5):
+        # mean 需要是 (D,)
+        if mean.dim() == 2 and mean.size(0) == 1:
+            mean = mean.squeeze(0)
+        assert mean.dim() == 1, "GaussianStatistics.mean should be a 1D vector (D,)"
         self.mean = mean
         self.cov = cov
-        self.L = cholesky_manual_parallel(cov + 1e-3 * torch.eye(cov.size(0), device=cov.device))
-        
-        self.mean = self.mean.cpu()
-        self.cov = self.cov.cpu()
-        self.L = self.L.cpu()
-        
-    def kl_divergence(self, other, eps=1e-6):
-        """计算KL散度"""
+        self.reg = reg
+        self.L = cholesky_manual_stable(cov, reg=reg)
+        self.L_weighted = None
+        self.weighted_cov = None
+
+    def initialize_weighted_covariance(self, weighted_cov: torch.Tensor):
+        self.weighted_cov = weighted_cov
+        self.L_weighted = cholesky_manual_stable(weighted_cov, reg=self.reg)
+
+    def sample(self, n_samples: int, cached_eps: torch.Tensor = None, use_weighted_cov: bool = True) -> torch.Tensor:
+        device = self.mean.device
         d = self.mean.size(0)
-        cov2_inv = torch.linalg.inv(other.cov + eps * torch.eye(d, device=other.cov.device))
-    
-        diff = self.mean - other.mean
-        kl = 0.5 * (
-            torch.logdet(other.cov + eps * torch.eye(d, device=other.cov.device)) -
-            torch.logdet(self.cov + eps * torch.eye(d, device=self.cov.device)) +
-            torch.trace(cov2_inv @ self.cov) + diff @ cov2_inv @ diff - d)
-        return kl
-    
-class NonlinearCompensator(nn.Module):
-    def __init__(self, dim):
-        super(NonlinearCompensator, self).__init__()
-        self.fc1 = nn.Linear(dim, dim, bias=False)
-        torch.nn.init.eye_(self.fc1.weight)
 
-        self.fc2 = nn.Sequential(
-            nn.Linear(dim, dim, bias=True),
-            nn.ReLU(),
-            nn.Linear(dim, dim, bias=True))
-        self.alphas =  nn.Parameter(torch.tensor([1.0, 0.0, 0.0]))
-        self.weight = 0.0
+        if cached_eps is None:
+            eps = torch.randn(n_samples, d, device=device)
+        else:
+            eps = cached_eps.to(device)
+            n_samples = eps.size(0)
 
-    def forward(self, x):
-        weights = F.softmax(self.alphas, dim=0)
-        y1 = self.fc1(x)
-        y2 = self.fc2(x)
-        y = weights[0]*x + weights[1] * y1 + weights[2] * y2
-        return (1.0 - self.weight) * y + self.weight * x
-    
-    def reg_loss(self):
-        weights = F.softmax(self.alphas, dim=0)
-        return (weights[0] + weights[1] - 1.0) ** 2
-    
+        L = self.L_weighted if (use_weighted_cov and self.L_weighted is not None) else self.L
+        samples = self.mean.unsqueeze(0) + eps @ L.t()  # (n_samples, D)
+        return samples
+
+
+class MultiMeanGaussianStatistics:
+    """
+    多均值（K 个分量），共享同一协方差。
+    means: (K, D), probs: (K,), cov: (D, D)
+    """
+
+    def __init__(self, means: torch.Tensor, cov: torch.Tensor, probs: torch.Tensor, reg: float = 1e-5):
+        if isinstance(means, list):
+            means = torch.stack(means, dim=0)
+        assert means.dim() == 2, "MultiMeanGaussianStatistics.means should be (K, D)"
+        assert probs.dim() == 1 and probs.size(0) == means.size(0), "probs shape must be (K,) and match K"
+        self.means = means
+        self.probs = probs
+        self.cov = cov
+        self.reg = reg
+
+        self.L = cholesky_manual_stable(cov, reg=reg)
+        self.L_weighted = None
+        self.weighted_cov = None
+
+    def initialize_weighted_covariance(self, weighted_cov: torch.Tensor):
+        self.weighted_cov = weighted_cov
+        self.L_weighted = cholesky_manual_stable(weighted_cov, reg=self.reg)
+
+    def sample(self, n_samples: int, cached_eps: torch.Tensor = None, use_weighted_cov: bool = True) -> torch.Tensor:
+        device = self.means.device
+        d = self.means.size(1)
+
+        if cached_eps is None:
+            eps = torch.randn(n_samples, d, device=device)
+        else:
+            eps = cached_eps.to(device)
+            n_samples = eps.size(0)
+
+        indices = torch.multinomial(self.probs, n_samples, replacement=True)  # (n_samples,)
+        selected_means = self.means[indices]  # (n_samples, d)
+        L = self.L_weighted if (use_weighted_cov and self.L_weighted is not None) else self.L
+        noise = eps @ L.t()
+        samples = selected_means + noise
+        return samples
+
+
+# -----------------------------------------------------------------------------
+# Covariance smoothing across classes
+# -----------------------------------------------------------------------------
+def compute_weighted_covariances(stats_dict: Dict[int, object], temperature: float = 1.0, device: str = "cpu"):
+    """
+    基于类中心相似度，对协方差做加权平滑：Σ_i^w = Σ_j a_ij Σ_j 。
+    对单均值使用 mean，对多均值使用其均值的均值。
+    """
+    if len(stats_dict) == 0:
+        return stats_dict
+
+    class_ids = list(stats_dict.keys())
+    # 正确的类型判断
+    if isinstance(stats_dict[class_ids[0]], MultiMeanGaussianStatistics):
+        means = torch.stack([stats_dict[cid].means.mean(dim=0).to(device) for cid in class_ids])
+    else:
+        means = torch.stack([stats_dict[cid].mean.to(device) for cid in class_ids])
+
+    covs = torch.stack([stats_dict[cid].cov.to(device) for cid in class_ids])  # (C, D, D)
+    means_norm = F.normalize(means, dim=1)
+    sim_matrix = torch.mm(means_norm, means_norm.t())  # (C, C)
+    weights = F.softmax(sim_matrix / temperature, dim=1)  # (C, C)
+    weighted_covs = torch.einsum('ij,jkl->ikl', weights, covs)  # (C, D, D)
+
+    for idx, cid in enumerate(class_ids):
+        stats_dict[cid].initialize_weighted_covariance(weighted_covs[idx])
+
+    print(f"[INFO] Updated weighted covariances for {len(class_ids)} classes using mean similarity weighting.")
+    return stats_dict
+
+
+# -----------------------------------------------------------------------------
+# Drift Compensator
+# -----------------------------------------------------------------------------
 class Drift_Compensator(object):
     def __init__(self, args):
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+        # 旧接口保留（可选）
         self.original_stats = {}
-        self.linear_stats = {}
+        self.multi_mean_stats = {}
+        self.original_stats_shared_covariance = {}
+        self.multi_mean_stats_shared_covariance = {}
 
-        self.alpha_t = args['alpha_t']
-        self.gamma_1 = args['gamma_1']
-        self.auxiliary_data_size = args['auxiliary_data_size']
+        self.linear_original_stats = {}
+        self.linear_multi_mean_stats = {}
+        self.linear_original_stats_shared_covariance = {}
+        self.linear_multi_mean_stats_shared_covariance = {}
+
+        # 参数
+        self.n_clusters_per_class = args.get('n_class_clusters', 3)
+        self.n_task_clusters = args.get('n_task_clusters', 3)
+        self.cov_weighting_temperature = args.get('cov_weighting_temperature', 0.2)
+
+        self.alpha_t = args.get('alpha_t', 1.0)
+        self.gamma_1 = args.get('gamma_1', 1e-4)
+        self.auxiliary_data_size = args.get('auxiliary_data_size', 5000)
         self.args = args
+        self.compensate = args.get('compensate', True)
 
-    def update_stats(self, task_id, model_before, model_after, data_loader, compensate=False):
-        feats_before, feats_after, targets = self.extract_features_before_after(model_before, model_after, data_loader)
+        self.covariance_sharing_mode = args.get('covariance_sharing_mode', 'per_class')
+        assert self.covariance_sharing_mode in {'per_class', 'task_wise', 'global'}, \
+            "covariance_sharing_mode must be one of: 'per_class', 'task_wise', 'global'"
 
-        if task_id == 0:
-            try:
-                self.cached_Z = torch.load('cached_data/cached_Gaussian_samples.pt', weights_only=False)
-            except:
-                self.cached_Z = torch.randn(50000, feats_before.size(1))
-                torch.save(self.cached_Z, 'cached_data/cached_Gaussian_samples.pt', weights_only=False)
+        self.cached_Z = None
+        self.aux_loader = None
+        self._task_cov_cache = None  # (task_means, task_covs)
+        self.variants = {}           # 8 种分布变体存放处
 
-        original_stats = self.compute_class_statistics(feats_after, targets)
+    # --------------------- 数据/工具 ---------------------
+    def _enforce_min_distance(self, centers: np.ndarray, min_dist: float = 0.5) -> np.ndarray:
+        """确保聚类中心之间最小距离，避免坍缩"""
+        centers = centers.copy()
+        n = len(centers)
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                if dist < min_dist:
+                    direction = centers[j] - centers[i]
+                    direction /= (np.linalg.norm(direction) + 1e-8)
+                    centers[j] = centers[i] + direction * min_dist
+        return centers
 
-        assert set(original_stats.keys()).isdisjoint(set(self.original_stats.keys())), \
-            "original_stats keys should not overlap with self.original_stats keys"
-        
-        self.original_stats.update(original_stats)
-
-        if compensate:
-            aux_loader = self.get_aux_loader(self.args)
-            feats_aux_before, feats_aux_after = self.extract_features_before_after_for_auxiliary_data(
-                model_before, model_after, aux_loader)
-        
-            feats_before_with_aux = torch.cat([feats_before, feats_aux_before], dim=0)
-            feats_after_with_aux = torch.cat([feats_after, feats_aux_after], dim=0)
-                
-            if task_id > 0:
-                self.linear_stats = self.update_statistics_with_linear_transform(
-                    self.linear_stats, feats_before_with_aux, feats_after_with_aux)
-                # self.linear_stats = self.update_statistics_with_weak_nonlinear_transform(
-                #     self.linear_stats, feats_before_with_aux, feats_after_with_aux)
-                    
-        self.linear_stats.update(original_stats)
-
-        
     @torch.no_grad()
     def extract_features_before_after(self, model_before, model_after, data_loader):
-        """对比模型训练前后的特征变化"""
         model_before, model_after = model_before.to(self.device), model_after.to(self.device)
-        model_before.eval(); model_after.eval()
-        
-        feats_before, feats_after, targets, indices = [], [], [], []
-        
-        for batch_indices, inputs, batch_targets in data_loader:
+        model_before.eval()
+        model_after.eval()
+
+        feats_before, feats_after, targets = [], [], []
+        # 期望 data_loader 产出: (batch_indices, inputs, batch_targets)
+        for batch in data_loader:
+            if len(batch) == 3:
+                _, inputs, batch_targets = batch
+            else:
+                # 兼容仅 (inputs, targets)
+                inputs, batch_targets = batch
             inputs = inputs.to(self.device)
             feats_before.append(model_before(inputs).cpu())
             feats_after.append(model_after(inputs).cpu())
             targets.append(batch_targets)
-            indices.append(batch_indices)
 
         feats_before = torch.cat(feats_before)
         feats_after = torch.cat(feats_after)
         targets = torch.cat(targets)
-        indices = torch.cat(indices)
-        return feats_before[indices], feats_after[indices], targets[indices]
+        return feats_before, feats_after, targets
 
     @torch.no_grad()
     def extract_features_before_after_for_auxiliary_data(self, model_before, model_after, data_loader):
         model_before, model_after = model_before.to(self.device), model_after.to(self.device)
-        model_before.eval(); model_after.eval()
-        
-        feats_before, feats_after= [], []
-        for inputs, batch_targets in data_loader:
+        model_before.eval()
+        model_after.eval()
+
+        feats_before, feats_after = [], []
+        # 期望 aux_loader 产出: (inputs, batch_targets) 或 (inputs, )
+        for batch in data_loader:
+            if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+                inputs = batch[0]
+            else:
+                inputs = batch
             inputs = inputs.to(self.device)
             feats_before.append(model_before(inputs).cpu())
             feats_after.append(model_after(inputs).cpu())
@@ -164,35 +255,53 @@ class Drift_Compensator(object):
         feats_before = torch.cat(feats_before)
         feats_after = torch.cat(feats_after)
         return feats_before, feats_after
-    
-    def compute_class_statistics(self, features, labels):
-        unique_labels = torch.unique(labels)
-        stats_dict = {}
-        for lbl in unique_labels:
-            mask = (labels == lbl)
-            class_features = features[mask]
-            mean = class_features.mean(dim=0)
-            centered = class_features - mean
-            cov = (centered.T @ centered) / (class_features.size(0) - 1)
-            stats_dict[int(lbl.item())] = GaussianStatistics(mean, cov)
-        return stats_dict
-    
-    def update_statistics_with_linear_transform(self, stats, features_before, features_after):
-        print("基于当前任务的前后特征构建线性补偿器(alpha_1-SLDC)")
-        features_before = features_before.to(self.device)
-        features_after = features_after.to(self.device)
-        X = F.normalize(features_before, dim=1)
-        Y = F.normalize(features_after, dim=1)
-        XTX = X.T @ X + self.gamma_1 * torch.eye(X.size(1), device=self.device)
+
+    def compute_clusters(self, features: torch.Tensor, min_distance: float = 0.5, compute_covariances: bool = True):
+        """对特征做 KMeans，返回簇均值（和可选协方差）"""
+        features_np = features.cpu().numpy()
+        kmeans = KMeans(n_clusters=self.n_task_clusters, n_init=20, init='k-means++').fit(features_np)
+        centers = kmeans.cluster_centers_
+        centers = self._enforce_min_distance(centers, min_distance)
+        labels = kmeans.labels_
+
+        cluster_means = []
+        cluster_covs = []
+        for i in range(self.n_task_clusters):
+            cluster_mask = labels == i
+            cluster_features = torch.from_numpy(features_np[cluster_mask])
+            cluster_mean = cluster_features.mean(dim=0)
+            cluster_means.append(cluster_mean)
+            if compute_covariances:
+                cluster_cov = torch.cov(cluster_features.T)
+                cluster_covs.append(cluster_cov)
+
+        if compute_covariances:
+            return torch.stack(cluster_means), torch.stack(cluster_covs)
+        else:
+            return torch.stack(cluster_means)
+
+    # --------------------- 线性变换 ---------------------
+    def compute_linear_transform(self, features_before: torch.Tensor, features_after: torch.Tensor, normalize: bool = True):
+        """基于前/后特征构建线性补偿矩阵 W（无偏置）"""
+        print("基于当前任务的前后特征构建仿射补偿器(alpha_1-SLDC-Affine) - 无偏置版本")
+        device = self.device
+        features_before = features_before.to(device)
+        features_after = features_after.to(device)
+
+        if normalize:
+            X = F.normalize(features_before, dim=1)
+            Y = F.normalize(features_after, dim=1)
+        else:
+            X = features_before
+            Y = features_after
+
+        n_samples, dim = X.size()
+        XTX = X.T @ X + 1e-4 * torch.eye(dim, device=device)
         XTY = X.T @ Y
-        W_global = torch.linalg.solve(XTX, XTY)
+        W_global = torch.linalg.solve(XTX, XTY)  # (D, D)
+        weight = math.exp(-n_samples / (self.alpha_t * dim))
+        W_global = (1 - weight) * W_global + weight * torch.eye(dim, device=device)
 
-        dim = features_before.size(1)
-        sample_num = features_before.size(0)
-
-        weight = math.exp(- sample_num / (self.alpha_t*dim))
-        print(weight)
-        W_global = (1 - weight)  * W_global + weight * torch.eye(dim, device=self.device)
         feats_new_after_pred = features_before @ W_global
         feat_diffs = (features_after - features_before).norm(dim=1).mean().item()
         feat_diffs_pred = (features_after - feats_new_after_pred).norm(dim=1).mean().item()
@@ -200,186 +309,201 @@ class Drift_Compensator(object):
         s = torch.linalg.svdvals(W_global)
         max_singular = s[0].item()
         min_singular = s[-1].item()
-        print(f"线性变换矩阵对角线元素平均值：{W_global.diag().mean().item():.4f}, 加权权重：{weight:.4f}, 样本数量：{sample_num}")
-        print(f"线性修正前特征差异:{feat_diffs:.4f}; 修正后差异:{feat_diffs_pred:.4f}; 变换矩阵最大奇异值:{max_singular:.2f}; 最小奇异值:{min_singular:.2f}")
 
-        updated_stats = {}
-        for class_id, gauss in stats.items():
-            old_mean = gauss.mean.to(self.device)
-            old_cov = gauss.cov.to(self.device)
-            new_mean = old_mean @ W_global
-            new_cov = W_global.T @ old_cov @ W_global + 1e-2 * torch.eye(old_cov.size(0), device=old_cov.device)
-            updated_stats[class_id] = GaussianStatistics(new_mean, new_cov)
-        return updated_stats
+        print( 
+            f"仿射变换矩阵（非对称）对角线元素均值：{W_global.diag().mean().item():.4f}，"
+            f"融合权重：{weight:.4f}，样本数量：{n_samples}；"
+            f"线性修正前差异：{feat_diffs:.4f}；修正后差异：{feat_diffs_pred:.4f}；"
+            f"最大奇异值：{max_singular:.2f}；最小奇异值：{min_singular:.2f}")
+         
+        return W_global
 
-    def optimize_nonlinear_transform(self, features_before, features_after):
-        features_after = F.normalize(features_after, dim=1)
-        features_before = F.normalize(features_before, dim=1)
-        model = NonlinearCompensator(features_after.size(1)).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
-        steps = 5000
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=5e-4)
-        for step in range(steps):
-            random_indices = torch.randint(0, features_before.shape[0], (32, ))
-            features_before_batch = features_before[random_indices]
-            features_after_batch = features_after[random_indices]
-            optimizer.zero_grad()
-            output = model(features_before_batch)
-            loss = criterion(output, features_after_batch)
-            loss_total = loss
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            if (step + 1) % 2500 == 0:
-                print(f"弱非线性补偿器训练: Step {step + 1}, Loss_total: {loss_total.item():.4f}, Loss: {loss.item():.4f}")
-        model.eval()
-        return model, tuple(F.softmax(model.alphas, dim=0).detach().cpu().tolist())
+    def _transform_stats_with_W(self, stats_dict: Dict[int, object], W: torch.Tensor) -> Dict[int, object]:
+        """x' = x @ W  =>  μ' = μ @ W,  Σ' = W^T Σ W"""
+        W = W.cpu()
+        if stats_dict is None or len(stats_dict) == 0:
+            return {}
+        WT = W.t()
+        out = {}
+        for cid, stat in stats_dict.items():
+            if isinstance(stat, MultiMeanGaussianStatistics):
+                means = stat.means @ W           # (K, D)
+                cov = WT @ stat.cov @ W +        # (D, D)
+                new_stat = MultiMeanGaussianStatistics(means, cov, probs=stat.probs, reg=stat.reg)
+            else:  # GaussianStatistics
+                mean = stat.mean @ W             # (D,)
+                cov = WT @ stat.cov @ W
+                new_stat = GaussianStatistics(mean, cov, reg=stat.reg)
+            out[cid] = new_stat
+        return out
+    
 
-    def update_statistics_with_weak_nonlinear_transform(self, stats, features_before, features_after):
-        features_before = features_before.to(self.device)
-        features_after = features_after.to(self.device)
-        print("基于当前任务的前后特征构建弱非线性补偿器")
-        mapping, alpha = self.optimize_nonlinear_transform(features_before, features_after)
-        
-        # 评估修正效果（可选）
-        with torch.no_grad():
-            feats_new_after_pred = mapping(F.normalize(features_before, dim=1)) * features_before.norm(dim=1, keepdim=True)
-            feat_diffs_pred = (features_after - feats_new_after_pred).norm(dim=1).mean().item()
-            print(f"弱非线性修正后特征差异: {feat_diffs_pred:.4f}, Alpha: {alpha}")
-        
-        # 使用雅可比矩阵近似更新高斯分布
-        new_stats = {}
-        for class_id, gauss in stats.items():
-            class_mean = gauss.mean.to(self.device)
-            class_cov = gauss.cov.to(self.device)
-            
-            # 计算雅可比矩阵
-            J = self.compute_jacobian(mapping, class_mean)
-            
-            # 计算新均值
-            with torch.no_grad():
-                x_norm = F.normalize(class_mean.unsqueeze(0), dim=1)
-                y_norm = mapping(x_norm)
-                new_mean = y_norm.squeeze(0) * class_mean.norm()
-            
-            # 计算新协方差
-            A = mapping.fc1.weight
-            linear_part = alpha[1] * A  # 线性部分的权重
-            nonlinear_part = alpha[2] * J  # MLP部分的雅可比近似
-            total_transform = alpha[0] * torch.eye(class_mean.size(0), device=self.device) + linear_part + nonlinear_part
-            
-            # 应用变换：cov_new = J @ cov_old @ J^T
-            new_cov = total_transform @ class_cov @ total_transform.T
-            new_cov = new_cov + 1e-3 * torch.eye(new_cov.size(0), device=new_cov.device)  # 正则化
-            
-            new_stats[class_id] = GaussianStatistics(new_mean.cpu(), new_cov.cpu())
-        
-        return new_stats
 
-    def compute_jacobian(self, model, x):
+    # --------------------- Task-wise 协方差缓存 ---------------------
+    def _get_task_cov_bank(self, features: torch.Tensor):
+        """返回 (cluster_means, cluster_covs)，并缓存避免重复 KMeans。"""
+        if self._task_cov_cache is not None:
+            return self._task_cov_cache
+        task_cluster_means, task_cluster_covs = self.compute_clusters(
+            features, min_distance=0.5, compute_covariances=True
+        )
+        self._task_cov_cache = (task_cluster_means.to(features.device), task_cluster_covs.to(features.device))
+        return self._task_cov_cache
+
+    # --------------------- 统一构建统计（单/多均值 × 是否用 task-wise 协方差） ---------------------
+    def _build_stats(self, features: torch.Tensor, labels: torch.Tensor,
+                     multi_means: bool, use_task_cov: bool) -> Dict[int, object]:
         """
-        计算模型在输入x处的雅可比矩阵
+        multi_means: False => 单均值；True => 类内多均值（共享同一个类协方差）
+        use_task_cov: False => 类内协方差由该类样本估计；True => 用 task-wise 聚类协方差按相似度加权得到类协方差
         """
-        x_norm = F.normalize(x.unsqueeze(0), dim=1).detach().requires_grad_(True)
-        
-        # 前向传播
-        y = model(x_norm)
-        
-        # 计算雅可比矩阵
-        J = torch.zeros(y.size(1), x_norm.size(1), device=self.device)
-        for i in range(y.size(1)):
-            grad_output = torch.zeros_like(y)
-            grad_output[0, i] = 1.0
-            grad_input = torch.autograd.grad(y, x_norm, grad_outputs=grad_output, 
-                                            retain_graph=True, create_graph=False)[0]
-            J[i] = grad_input.squeeze(0)
-        
-        return J.detach()
+        device = features.device
+        unique_labels = torch.unique(labels)
+        stats = {}
 
-    def refine_classifiers(self, fc, task_id, epochs=5):
-        if task_id > 0:
-            # 不使用辅助数据的分类器
-            original_fc = self.train_classifier_with_cached_samples(copy.deepcopy(fc), self.original_stats, epochs)
-            linear_fc = self.train_classifier_with_cached_samples(copy.deepcopy(fc), self.linear_stats, epochs) 
+        if use_task_cov:
+            task_means, task_covs = self._get_task_cov_bank(features)  # (T, D), (T, D, D)
 
-        elif task_id == 0:
-            # 初始任务，直接复制分类器
-            original_fc = self.train_classifier_with_cached_samples(copy.deepcopy(fc), self.original_stats, epochs)
-            linear_fc = copy.deepcopy(original_fc)
-        
-        return {'original': original_fc,
-                'linear_compensate': linear_fc}
+        for lbl in unique_labels:
+            mask = (labels == lbl)
+            class_feats = features[mask]  # (N_c, D)
 
-    def get_aux_loader(self, args):
-        if hasattr(self, 'aux_loader'):
-            return self.aux_loader
-        
-        aux_dataset_type = args.get('aux_dataset_type', 'image_folder')
-        num_samples = args.get('auxiliary_data_size', 1024)
+            # 1) 计算均值（单/多）
+            if multi_means:
+                # 多均值：只取中心，不计算每簇协方差（类内共享一个 Σ_c）
+                # 使用类内 KMeans 个数为 args 中的 n_class_clusters
+                kmeans = KMeans(n_clusters=self.n_clusters_per_class, n_init=20, init='k-means++').fit(
+                    class_feats.cpu().numpy()
+                )
+                centers = self._enforce_min_distance(kmeans.cluster_centers_, min_dist=0.1)
+                class_means = torch.from_numpy(centers).to(device=device, dtype=class_feats.dtype)  # (K, D)
+            else:
+                class_means = class_feats.mean(dim=0, keepdim=True)  # (1, D)
 
-        transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+            # 2) 计算协方差（类内 or task-wise）
+            if use_task_cov:
+                query = class_means.mean(dim=0, keepdim=True)  # (1, D)
+                sim = F.normalize(query, dim=1) @ F.normalize(task_means, dim=1).t()  # (1, T)
+                attn = sim.squeeze(0).softmax(dim=-1)  # (T,)
+                class_cov = sum(attn[i] * task_covs[i] for i in range(task_covs.size(0)))
+            else:
+                class_cov = torch.cov(class_feats.T)
 
-        if aux_dataset_type == 'imagenet':
-          if 'auxiliary_data_path' not in args:
-            raise ValueError("当 aux_dataset_type='image_folder' 时，必须提供 auxiliary_data_path")
-          dataset = datasets.ImageFolder(args['auxiliary_data_path'], transform=transform)
-        elif aux_dataset_type == 'cifar10':
-          dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-        elif aux_dataset_type == 'svhn':
-          dataset = datasets.SVHN(root='./data', split='train', download=True, transform=transform)
-        else:
-          raise ValueError(f"不支持的 aux_dataset_type: {aux_dataset_type}")
+            # 3) 打包
+            cid = int(lbl.item())
+            if multi_means:
+                K = class_means.size(0)
+                probs = torch.full((K,), 1.0 / K, device=device)
+                stats[cid] = MultiMeanGaussianStatistics(class_means, class_cov, probs=probs)
+            else:
+                stats[cid] = GaussianStatistics(class_means, class_cov)  # ctor 会 squeeze 到 (D,)
+        return stats
 
-        torch.manual_seed(1)
-        indices = np.random.choice(len(dataset), num_samples, replace=False)
-        train_subset = Subset(dataset, indices)
+    # --------------------- 8 种分布一把生成 ---------------------
+    def build_all_variants(self, task_id: int, model_before: nn.Module, model_after: nn.Module, data_loader):
+        feats_before, feats_after, labels = self.extract_features_before_after(
+            model_before, model_after, data_loader)
 
-        self.aux_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
-        return self.aux_loader
+        # 初始化缓存噪声
+        if self.cached_Z is None:
+            self.cached_Z = torch.randn(50000, feats_after.size(1))
 
-    def train_classifier_with_cached_samples(self, fc, stats, epochs):
-        epochs = 6
+        # 线性补偿矩阵
+        W = None
+        if self.compensate and task_id > 0:
+            aux_loader = self.get_aux_loader(self.args)
+            feats_aux_before, feats_aux_after = self.extract_features_before_after_for_auxiliary_data(
+                model_before, model_after, aux_loader)
+            feats_b = torch.cat([feats_before, feats_aux_before], dim=0)
+            feats_a = torch.cat([feats_after, feats_aux_after], dim=0)
+            W = self.compute_linear_transform(feats_b, feats_a)
+
+        self._task_cov_cache = None
+        _ = self._get_task_cov_bank(feats_after)
+
+        # 组合开关
+        configs = []
+        for multi_means in (False, True):
+            for use_task_cov in (False, True):
+                for use_linear in (False, True):
+                    configs.append((multi_means, use_task_cov, use_linear))
+
+        variants = {}
+        for m, t, l in configs:
+            key = f"mm{int(m)}_tc{int(t)}_lin{int(l)}"
+            # 1) 在原空间构建
+            base_stats = self._build_stats(
+                features=feats_after, labels=labels,
+                multi_means=m, use_task_cov=t
+            )
+            # 2) 线性变换
+            if l and W is not None:
+                stats = self._transform_stats_with_W(base_stats, W)
+            else:
+                stats = base_stats
+
+            # 3) 协方差语义平滑（如果你希望只对部分变体做，可另设开关）
+            # stats = compute_weighted_covariances(
+            #     stats, temperature=self.cov_weighting_temperature, device=self.device
+            # )
+            
+            variants[key] = stats
+
+        self.variants = variants
+        print(f"[INFO] Built {len(variants)} distribution variants: {list(variants.keys())}")
+        return variants
+
+    # --------------------- 分类器再训练（采样驱动） ---------------------
+    def train_classifier_with_cached_samples(self, fc: nn.Module, stats: Dict[int, object],
+                                             epochs: int = 6, use_weighted_cov: bool = False) -> nn.Module:
+        """用各分布采样的特征对分类器做快速再训练"""
+        epochs = int(epochs)
         num_samples_per_class = 1024
-        batch_size = 32 * len(stats) // 10
-        lr = 5e-4     
-        fc.to(self.device)
-        optimizer = torch.optim.Adam(fc.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=epochs, eta_min=lr/10)
-        
+        batch_size = max(32 * max(1, len(stats) // 10), 32)
+        lr = 0.01
+
+        fc = copy.deepcopy(fc).to(self.device)
+        optimizer = torch.optim.SGD(fc.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=epochs, eta_min=lr / 10)
+
         cached_Z = self.cached_Z.to(self.device)
 
-        # 准备数据 - 确保不原地修改
         all_samples, all_targets = [], []
+        class_means = []
+
         for class_id, gauss in stats.items():
-            class_mean = gauss.mean.to(self.device)
-            class_L = gauss.L.to(self.device)
-            
-            # 使用新的随机索引避免修改缓存
-            start_idx = (class_id * num_samples_per_class) % cached_Z.size(0)
+            # 为采样选择 L 或 L_weighted
+            if isinstance(gauss, MultiMeanGaussianStatistics):
+                class_mean = gauss.means.mean(dim=0).to(self.device)
+                L_matrix = gauss.L_weighted.to(self.device) if use_weighted_cov and gauss.L_weighted is not None else gauss.L.to(self.device)
+            else:
+                class_mean = gauss.mean.to(self.device)
+                L_matrix = gauss.L_weighted.to(self.device) if use_weighted_cov and gauss.L_weighted is not None else gauss.L.to(self.device)
+
+            class_means.append(class_mean)
+
+            # 从缓存噪声取一段
+            start_idx = (int(class_id) * num_samples_per_class) % cached_Z.size(0)
             end_idx = start_idx + num_samples_per_class
             if end_idx > cached_Z.size(0):
-                Z = torch.cat([cached_Z[start_idx:], cached_Z[:end_idx-cached_Z.size(0)]], dim=0)
+                Z = torch.cat([cached_Z[start_idx:], cached_Z[: end_idx - cached_Z.size(0)]], dim=0)
             else:
                 Z = cached_Z[start_idx:end_idx]
-            
-            samples = class_mean + torch.mm(Z, class_L.t())
-            targets = torch.full((num_samples_per_class,), class_id, device=self.device)
-            
+
+            # mean + Z @ L^T
+            samples = class_mean + Z @ L_matrix.t()
+            targets = torch.full((num_samples_per_class,), int(class_id), device=self.device)
+
             all_samples.append(samples)
             all_targets.append(targets)
 
-        # 拼接并克隆张量
-        inputs = torch.cat(all_samples, dim=0).detach().clone()  # 确保不共享内存
+        class_means = torch.stack(class_means)
+        class_mean_norm = class_means.norm(dim=-1, keepdim=True).mean(dim=0).squeeze()
+
+        inputs = torch.cat(all_samples, dim=0).detach().clone()
         targets = torch.cat(all_targets, dim=0).detach().clone()
 
-        # 训练循环
         for epoch in range(epochs):
-            # 创建新的随机索引而不修改原数据
             perm = torch.randperm(inputs.size(0), device=self.device)
             inputs_shuffled = inputs[perm]
             targets_shuffled = targets[perm]
@@ -387,291 +511,94 @@ class Drift_Compensator(object):
             losses = 0.0
             num_samples = inputs.size(0)
             num_complete_batches = num_samples // batch_size
-            
+
             for batch_idx in range(num_complete_batches + 1):
                 start_idx = batch_idx * batch_size
                 end_idx = min((batch_idx + 1) * batch_size, num_samples)
-                
                 if start_idx >= end_idx:
                     continue
-                    
+
                 inp = inputs_shuffled[start_idx:end_idx]
                 tgt = targets_shuffled[start_idx:end_idx]
-                
+
                 optimizer.zero_grad()
-                output = fc(inp)
-                loss = symmetric_cross_entropy_loss(output, tgt)
-                
-                # 启用异常检测(调试用)
-                # with torch.autograd.detect_anomaly():
+                logits = fc(inp)
+
+                # 你可以切换为标准 CE 或 SCE
+                # loss = symmetric_cross_entropy_loss(logits, tgt)
+                loss = F.cross_entropy(logits, tgt)
+
                 loss.backward()
                 optimizer.step()
-                
                 losses += loss.item() * (end_idx - start_idx)
-            
-            loss = losses / num_samples
+
+            loss_epoch = losses / num_samples
             if (epoch + 1) % 3 == 0:
-                print(f"分类器矫正训练 (cached samples): Epoch {epoch + 1}, Loss: {loss:.4f}")
+                print(f"[INFO] Cached-sample classifier training: Epoch {epoch + 1}, Loss: {loss_epoch:.4f}")
             scheduler.step()
-        
+
         return fc
 
+    def refine_classifiers_from_variants(self, fc: nn.Module, epochs: int = 6, use_weighted_cov: bool = False) -> Dict[str, nn.Module]:
+        """对 self.variants 里的每个分布各训练一个分类器"""
+        assert hasattr(self, 'variants') and len(self.variants) > 0, "No variants found. Call build_all_variants first."
+        out = {}
+        for name, stats in self.variants.items():
+            clf = self.train_classifier_with_cached_samples(fc, stats, epochs=epochs, use_weighted_cov=use_weighted_cov)
+            out[name] = clf
+        print(f"[INFO] Trained {len(out)} classifiers from variants.")
+        return out
 
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# import math
-# import copy
-# from collections import defaultdict
+    # --------------------- 辅助数据加载 ---------------------
+    def get_aux_loader(self, args):
+        if self.aux_loader is not None:
+            return self.aux_loader
 
-# # --------------------------------------------------------------
-# # 1️⃣ 统计量容器（支持增量更新 + 线性映射）
-# # --------------------------------------------------------------
-# class ClassStat:
-#     """
-#     保存一个类别在当前累计特征空间中的统计量。
-#     只保存:
-#         N  : 已累计样本数（标量）
-#         mu : 均值               (d,)
-#         C  : 未中心化二阶矩   (d, d)   = Σ_i x_i x_i^T
-#     """
-#     def __init__(self, device: torch.device):
-#         self.device = device
-#         self.N   = 0                         # int
-#         self.mu  = None                      # (d,)
-#         self.C   = None                      # (d, d)
+        aux_dataset_type = args.get('aux_dataset', 'cifar10')
+        num_samples = int(args.get('auxiliary_data_size', 5000))
 
-#     def update(self, new_mu: torch.Tensor, new_cov: torch.Tensor, new_N: int):
-#         """
-#         参数:
-#             new_mu   – (d,) 新任务均值（已经在 *当前* 特征空间里）
-#             new_cov  – (d, d) 新任务协方差（已经在 *当前* 特征空间里）
-#             new_N    – int   新任务样本数
-#         """
-#         # 先把新任务的未中心化二阶矩算出来
-#         new_C = new_cov * (new_N - 1) + new_N * torch.ger(new_mu, new_mu)   # Σ_i x_i x_i^T
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
 
-#         if self.N == 0:                 # 第一次收到该类的数据
-#             self.N  = new_N
-#             self.mu = new_mu.clone()
-#             self.C  = new_C.clone()
-#             return
+        if aux_dataset_type == 'imagenet':
+            if 'auxiliary_data_path' not in args:
+                raise ValueError("必须提供 auxiliary_data_path")
+            dataset = datasets.ImageFolder(args['auxiliary_data_path'], transform=transform)
+        elif aux_dataset_type == 'cifar10':
+            dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+        elif aux_dataset_type == 'svhn':
+            dataset = datasets.SVHN(root='./data', split='train', download=True, transform=transform)
+        elif aux_dataset_type == 'flickr8k':
+            dataset = datasets.ImageFolder(args['auxiliary_data_path'], transform=transform)
+        else:
+            raise ValueError(f"不支持的 aux_dataset_type: {aux_dataset_type}")
 
-#         # 累计公式
-#         total_N = self.N + new_N
-#         mu_new = (self.N * self.mu + new_N * new_mu) / total_N
-#         C_new  = self.C + new_C
+        indices = np.random.choice(len(dataset), min(num_samples, len(dataset)), replace=False)
+        train_subset = Subset(dataset, indices)
 
-#         self.N  = total_N
-#         self.mu = mu_new
-#         self.C  = C_new
+        self.aux_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
+        return self.aux_loader
 
-#     def apply_linear(self, W: torch.Tensor):
-#         """把已经累计好的统计量映射到 W 的新空间（就地修改）。"""
-#         if self.N == 0:
-#             return
-#         # μ' = μ @ W
-#         self.mu = self.mu @ W
-#         # C' = W.T @ C @ W   （未中心化矩阵的线性变换）
-#         self.C = W.t() @ self.C @ W
 
-#     def get_cov(self, eps: float = 1e-6) -> torch.Tensor:
-#         """返回协方差 Σ = (C - N μ μ^T) / (N-1)."""
-#         if self.N <= 1:
-#             d = self.mu.shape[0]
-#             return torch.eye(d, device=self.device) * eps
-#         cov = (self.C - self.N * torch.ger(self.mu, self.mu)) / (self.N - 1)
-#         # 为数值稳定性加一点对角线噪声
-#         cov = cov + eps * torch.eye(cov.shape[0])
-#         return cov
-
-# # --------------------------------------------------------------
-# # 2️⃣ Drift_Compensator（增量统计 + LDA）
-# # --------------------------------------------------------------
-# class Drift_Compensator:
-#     def __init__(self, args):
-#         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-#         # 每个任务结束后累计的类统计量 (dict[int, ClassStat])
-#         self.class_stats = defaultdict(lambda: ClassStat(self.device))
-
-#         self.alpha_t = args['alpha_t']
-#         self.gamma_1 = args['gamma_1']
-#         self.auxiliary_data_size = args['auxiliary_data_size']
-#         self.args = args
-
-#     # -----------------------------------------------------------------
-#     # 2.1   统计量更新（包括线性补偿）
-#     # -----------------------------------------------------------------
-#     @torch.no_grad()
-#     def update_stats(self, task_id, model_before, model_after, data_loader):
-#         # ------------------- 1) 提取本任务特征 -------------------
-#         feats_before, feats_after, targets = self.extract_features_before_after(
-#             model_before, model_after, data_loader)
-
-#         # ------------------- 2) 线性映射 (if task_id>0) -------------------
-#         if task_id > 0:
-#             # 这里返回的 W_global 同时用于对已有统计量进行映射
-#             W_global = self._compute_linear_transform(feats_before, feats_after)
-#             # 把之前累计的所有类统计量“迁移”到新的特征空间
-#             for stat in self.class_stats.values():
-#                 stat.apply_linear(W_global)
-
-#         # ------------------- 3) 计算本任务的类统计（已在 final 空间） -------------------
-#         # 下面的 `new_stats` 为 dict[int, (mean, cov, N)]
-#         new_stats = {}
-#         unique_labels = torch.unique(targets)
-#         for lbl in unique_labels:
-#             mask = (targets == lbl)
-#             class_feats = feats_after[mask]                 # 已经是“after”特征
-#             N = class_feats.size(0)
-#             mu = class_feats.mean(dim=0)                    # (d,)
-#             centered = class_feats - mu
-#             cov = (centered.t() @ centered) / (N - 1)       # (d,d)
-#             new_stats[int(lbl.item())] = (mu, cov, N)
-
-#         # ------------------- 4) 增量合并 -------------------
-#         for cid, (mu, cov, N) in new_stats.items():
-#             self.class_stats[cid].update(mu, cov, N)
-
-#     # -----------------------------------------------------------------
-#     # 2.2   计算线性映射矩阵（与原来实现保持一致）
-#     # -----------------------------------------------------------------
-#     def _compute_linear_transform(self, X_before, X_after):
-#         """返回 W_global ∈ ℝ^{d×d} 用于把 before 映射到 after。"""
-#         X = X_before.to(self.device)
-#         Y = X_after.to(self.device)
-#         d = X.size(1)
-
-#         XTX = X.t() @ X + self.gamma_1 * torch.eye(d, device=self.device)
-#         XTY = X.t() @ Y
-#         W = torch.linalg.solve(XTX, XTY)
-
-#         # α_t‑weighting 讓矩陣更保守（原实现中的 weight ）
-#         weight = math.exp(- X.size(0) / (self.alpha_t * d))
-#         W = (1 - weight) * W + weight * torch.eye(d, device=self.device)
-#         return W.cpu()
-
-#     # -----------------------------------------------------------------
-#     # 2.3   特征提取（保持原实现）
-#     # -----------------------------------------------------------------
-#     @torch.no_grad()
-#     def extract_features_before_after(self, model_before, model_after, data_loader):
-#         model_before, model_after = model_before.to(self.device), model_after.to(self.device)
-#         model_before.eval(); model_after.eval()
-
-#         feats_before, feats_after, targets, indices = [], [], [], []
-
-#         for batch_indices, inputs, batch_targets in data_loader:
-#             inputs = inputs.to(self.device)
-#             feats_before.append(model_before(inputs).cpu())
-#             feats_after.append(model_after(inputs).cpu())
-#             targets.append(batch_targets)
-#             indices.append(batch_indices)
-
-#         feats_before = torch.cat(feats_before)
-#         feats_after = torch.cat(feats_after)
-#         targets = torch.cat(targets)
-#         indices = torch.cat(indices)
-
-#         return feats_before[indices], feats_after[indices], targets[indices]
-
-#     # -----------------------------------------------------------------
-#     # 3️⃣ 生成 LDA 分类器（不再进行梯度学习）
-#     # -----------------------------------------------------------------
-#     def _build_lda_classifier(self, use_linear_stats: bool = False):
-#         """
-#         使用累计的 **类均值 & 类协方差** 直接构造 LDA 分类器。
-#         参数 `use_linear_stats` 只在 `refine_classifiers` 中用来标识
-#         “原始统计量” vs “线性补偿后统计量”。这里两者共享同一
-#         `self.class_stats`，因为在 `update_stats` 中已经把线性变换
-#         应用到了累计统计量上。
-#         """
-#         # 1) 收集统计量
-#         class_ids = sorted(self.class_stats.keys())
-#         num_classes = len(class_ids)
-#         d = next(iter(self.class_stats.values())).mu.shape[0]
-
-#         N_vec   = torch.tensor([self.class_stats[c].N for c in class_ids],
-#                                dtype=torch.float32)
-#         mu_vec  = torch.stack([self.class_stats[c].mu for c in class_ids])   # (C, d)
-#         cov_vec = torch.stack([self.class_stats[c].get_cov() for c in class_ids])  # (C, d, d)
-
-#         total_N = N_vec.sum()
-
-#         # 2) 类内散度矩阵 S_w
-#         S_w = cov_vec.sum(dim=0) + 1e-6 * torch.eye(d)
-
-#         # 3) 整体均值 μ
-#         overall_mu = (N_vec.unsqueeze(1) * mu_vec).sum(dim=0) / total_N   # (d,)
-
-#         # 4) 类间散度矩阵 S_b
-#         diff = mu_vec - overall_mu.unsqueeze(0)          # (C, d)
-#         S_b = (N_vec.unsqueeze(1).unsqueeze(2) *
-#                diff.unsqueeze(2) @ diff.unsqueeze(1)).sum(dim=0)   # (d, d)
-
-#         # 5) 广义特征分解： S_w^{-1} S_b
-#         # 为了数值稳定，使用 torch.linalg.eig on a symmetric matrix:
-#         Sw_inv_Sb = torch.linalg.solve(S_w, S_b)
-
-#         eigvals, eigvecs = torch.linalg.eig(Sw_inv_Sb)
-#         eigvals = eigvals.real
-#         eigvecs = eigvecs.real
-
-#         # 取前 (C-1) 个最大的特征向量作为投影矩阵
-#         k = max(1, num_classes - 1)  # 二分类时 k=1
-#         idx = torch.argsort(eigvals, descending=True)[:k]
-#         W_lda = eigvecs[:, idx]                     # (d, k)
-
-#         # 6) 把每个类的均值投影到 LDA 子空间
-#         mu_proj = mu_vec @ W_lda                     # (C, k)
-
-#         # 7) 在投影空间直接求最小二乘解把投影空间映射到 “one‑hot”标签
-#         #    这相当于一次性的线性分类层：  W_fc = (Y^+) * mu_proj.T
-#         #    Y 为 one‑hot (C, C)
-#         Y_onehot = torch.eye(num_classes)           # (C, C)
-#         # 使用伪逆得到最小二乘解
-#         W_fc = torch.linalg.pinv(mu_proj) @ Y_onehot                     # (k, C)
-#         b_fc = torch.zeros(num_classes)              # 偏置设为 0
-
-#         # 8) 包装成 nn.Module
-#         class LDA_Linear(nn.Module):
-#             def __init__(self, proj, weight, bias):
-#                 super().__init__()
-#                 self.register_buffer('proj', proj)   # (d, k)
-#                 self.fc = nn.Linear(weight.shape[0], weight.shape[1], bias=True)
-#                 self.fc.weight.data = weight.t()    # nn.Linear expects (out, in)
-#                 self.fc.bias.data = bias
-#             def forward(self, x):
-#                 # x : (B, d)
-#                 x = x @ self.proj                 # (B, k)
-#                 return self.fc(x)                 # (B, C)
-
-#         lda_classifier = LDA_Linear(W_lda, W_fc, b_fc).to(self.device)
-#         return lda_classifier
-
-#     # -----------------------------------------------------------------
-#     # 4️⃣ 重新构造分类器（不再进行梯度训练）
-#     # -----------------------------------------------------------------
-#     def refine_classifiers(self, fc, task_id):
-#         """
-#         `fc` 是原始模型在当前特征空间的线性层（用于获取维度信息）。
-#         这里我们直接返回两套 LDA 分类器：
-#             - "original"          : 直接使用累计统计量（已经被线性变换同步）
-#             - "linear_compensate" : 与上面相同，因为在线性补偿阶段我们已经把
-#                                    统计量映射到了最新空间，所以两者相等。
-#         若想保留 “未做线性补偿”的版本，可在 `update_stats` 前
-#         另存一份统计量副本再构造，但在大多数实验中只需要
-#         当前（已补偿）的 LDA 即可。
-#         """
-#         # 1) 把原始的全连接层丢掉，只保留特征维度信息
-#         #    (这里我们不需要对 fc 进行任何训练)
-#         # 2) 直接使用累计统计量构造 LDA 分类器
-#         lda_original = self._build_lda_classifier(use_linear_stats=False)
-
-#         # 如果在 `update_stats` 中已经对累计统计量做了线性映射，
-#         # 那么 “linear_compensate” 与 “original” 完全相同。
-#         # 为了兼容 API，仍然返回两个对象。
-#         lda_linear = copy.deepcopy(lda_original)
-
-#         return {'original': lda_original,
-#                 'linear_compensate': lda_linear}
+# -----------------------------------------------------------------------------
+# 使用示例（伪代码）
+# -----------------------------------------------------------------------------
+# args = dict(
+#     n_class_clusters=3,
+#     n_task_clusters=3,
+#     cov_weighting_temperature=0.2,
+#     alpha_t=1.0,
+#     gamma_1=1e-4,
+#     auxiliary_data_size=5000,
+#     aux_dataset='cifar10',
+#     compensate=True,
+# )
+# dc = Drift_Compensator(args)
+# variants = dc.build_all_variants(task_id, model_before, model_after, data_loader)
+# # 训练分类器
+# classifiers = dc.refine_classifiers_from_variants(fc, epochs=6, use_weighted_cov=False)

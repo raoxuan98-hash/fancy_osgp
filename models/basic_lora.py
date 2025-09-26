@@ -176,10 +176,10 @@ class PlainLoRAViT(nn.Module):
             self.lora_modules[f"block_{idx}_mlp_fc1"] = fc1_adapter
 
 
-            # # --- MLP fc2 ---
-            # fc2_adapter = LoRALinear(blk.mlp.fc2, r=self.r, alpha=self.alpha)
-            # blk.mlp.fc2 = fc2_adapter
-            # self.lora_modules[f"block_{idx}_mlp_fc2"] = fc2_adapter
+            # --- MLP fc2 ---
+            fc2_adapter = LoRALinear(blk.mlp.fc2, r=self.r, alpha=self.alpha)
+            blk.mlp.fc2 = fc2_adapter
+            self.lora_modules[f"block_{idx}_mlp_fc2"] = fc2_adapter
 
         self.vit = vit_model
 
@@ -242,11 +242,11 @@ class PlainLoRAViT(nn.Module):
                 adapter: LoRALinear = self.lora_modules[name_fc1]
                 blk.mlp.fc1 = adapter.linear
 
-            # # fc2
-            # name_fc2 = f"block_{idx}_mlp_fc2"
-            # if name_fc2 in self.lora_modules:
-            #     adapter: LoRALinear = self.lora_modules[name_fc2]
-            #     blk.mlp.fc2 = adapter.linear
+            # fc2
+            name_fc2 = f"block_{idx}_mlp_fc2"
+            if name_fc2 in self.lora_modules:
+                adapter: LoRALinear = self.lora_modules[name_fc2]
+                blk.mlp.fc2 = adapter.linear
 
         self.lora_modules = nn.ModuleDict()  # 清空
 

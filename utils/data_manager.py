@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR100_224, iImageNetR, iCUB200_224, iResisc45_224, iCARS196_224, iSketch345_224,iDomainNet
+from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR100_224, iImageNetR, iCUB200_224, iResisc45_224, iCARS196_224, iSketch345_224, iDomainNet, iFood101_224, iOxfordPet37_224, iCaltech101_224
 from copy import deepcopy
 import random
 from utils.toolkit import write_domain_img_file2txt, split_domain_txt2txt
@@ -27,7 +27,6 @@ class DataManager(object):
             for _ in range(nb_tasks - 1):
                 self._increments.append(increment)
         else:
-            # 原有逻辑（按 increment 填充直到覆盖所有类）
             while sum(self._increments) + increment < len(self._class_order):
                 self._increments.append(increment)
             offset = len(self._class_order) - sum(self._increments)
@@ -125,7 +124,6 @@ class DataManager(object):
             DummyDataset(val_data, val_targets, trsf, self.use_path)
 
     def _setup_data(self, dataset_name, shuffle, seed):
-        
         args_for_idata = dict(self.args) if self.args else {}
         args_for_idata.setdefault('init_cls', self.init_cls)
         args_for_idata.setdefault('increment', self.increment)
@@ -244,7 +242,7 @@ def _get_idata(dataset_name, args=None):
         return iImageNetR()
     elif name == 'cub200_224':
         return iCUB200_224()
-    elif name == 'resisc45':
+    elif name == 'resisc45_224':
         return iResisc45_224()
     elif name == 'cars196_224':
         return iCARS196_224()
@@ -252,6 +250,12 @@ def _get_idata(dataset_name, args=None):
         return iSketch345_224()
     elif name == 'domainnet':
         return iDomainNet(args)
+    elif name == 'food101_224':
+        return iFood101_224()
+    elif name == 'oxfordpet37_224':
+        return iOxfordPet37_224()
+    elif name == 'caltech101_224':
+        return iCaltech101_224()
     else:
         raise NotImplementedError('Unknown dataset {}.'.format(dataset_name))
 

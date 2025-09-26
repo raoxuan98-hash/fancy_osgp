@@ -44,7 +44,6 @@ def set_smart_defaults(ns):
 # 2️⃣  主入口
 # --------------------------------------------------------------
 def main(args):
-    """把已经解析好的 ``Namespace`` 交给 trainer。"""
     train(args)
 
 
@@ -55,12 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='SLDC experiments unified management (grouped arguments).',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
+    
     # ------------------------------------------------------------------
     # 基础选项
     # ------------------------------------------------------------------
     basic = parser.add_argument_group('basic', 'General / high‑level options')
-    basic.add_argument('--dataset', type=str, default='imagenet-r', choices=['imagenet-r', 'cifar100_224', 'cub200_224', 'cars196_224'], help='Dataset to use')
+    basic.add_argument('--dataset', type=str, default='imagenet-r', choices=['imagenet-r', 'cifar100_224', 'cub200_224', 'cars196_224', 'caltech101_224', 'oxfordpet37_224', 'food101_224', 'resisc45_224'], help='Dataset to use')
     basic.add_argument('--smart_defaults', action='store_true', default=False, help='If set, overwrite a few hyper‑parameters according to the dataset.')
     basic.add_argument('--prefix', type=str, default='original', help='Prefix for output folders / logs.')
     basic.add_argument('--test', action=argparse.BooleanOptionalAction, default=False, help='Run in test mode (single seed, quick).')
@@ -91,20 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument('--weight_decay', type=float, default=3e-5, help='Weight decay.')
     model.add_argument('--device', nargs='+', default=['0'], help='CUDA device ids, e.g. --device 0 1 2')
 
-
     # ------------------------------------------------------------------
     # LoRA
     # ------------------------------------------------------------------
     model.add_argument('--lora_rank', type=int, default=4, help='LoRA rank.')
     model.add_argument('--lora_type', type=str, default="sgp_lora", choices=['basic_lora', 'osgp_lora', 'sgp_lora', 'nsp_lora', 'full'], help='Type of LoRA adaptor.')
-    model.add_argument('--proj_temp', type=float, default=8, help='Projection temperature.')
+    model.add_argument('--proj_temp', type=float, default=2, help='Projection   temperature.')
 
     # NSP相关的参数
     model.add_argument('--nsp_eps', type=float, default=0.05, choices=[0.05, 0.10])
     model.add_argument('--nsp_weight', type=float, default=0.0, choices=[0.0, 0.02, 0.05])
     
     # SGP相关的参数
-    model.add_argument('--trace_k', type=float, default=0.2 , help='Flag for osgp_lora.')
+    model.add_argument('--trace_k', type=float, default=1.0 , help='Flag for osgp_lora.')
     model.add_argument('--weight_kind', type=str, default='log1p', choices=["exp", "log1p", "rational1", "rational2", "sqrt_rational2", "power_family", "stretched_exp"])
     model.add_argument('--weight_p', type=float, default=1.0, help='Weight p.')
 
@@ -115,38 +113,40 @@ def build_parser() -> argparse.ArgumentParser:
     # ------------------------------------------------------------------
     # 训练相关参数
     # ------------------------------------------------------------------
-    train_grp = parser.add_argument_group('training', 'Optimisation & schedule')
+    train_grp = parser.add_argument_group('training', 'Optimisation & schedule')  
     train_grp.add_argument('--sce_a', type=float, default=0.5, help='Symmetric cross‑entropy A.')
     train_grp.add_argument('--sce_b', type=float, default=0.5, help='Symmetric cross‑entropy B.')
     train_grp.add_argument('--seed_list', nargs='+', type=int, default=[1993], help='Random seeds for multiple runs.')
-    train_grp.add_argument('--epochs', type=int, default=1, help='Training epochs per task.')
-    train_grp.add_argument('--ca_epochs', type=int, default=5, help='Class‑augmentation epochs.')
+    train_grp.add_argument('--iterations', type=int, default=1500, help='Training iterations per task.')
+    train_grp.add_argument('--warmup_steps', type=int, default=200, help='Warm‑up steps.')
+    train_grp.add_argument('--ca_epochs', type=int, default=5, help='Classifier alignment epochs.')
     train_grp.add_argument('--optimizer', type=str, default='adamw', help='Optimizer name (adamw / sgd).')
-    train_grp.add_argument('--lrate', type=float, default=2e-4, help='Learning rate.')
+    train_grp.add_argument('--lrate', type=float, default=5e-4, help='Learning rate.')
     train_grp.add_argument('--head_scale', type=float, default=1.0, help='Scale for the classifier head.')
-    train_grp.add_argument('--batch_size', type=int, default=16, help='Batch size.')
+    train_grp.add_argument('--batch_size', type=int, default=24, help='Batch size.')
     train_grp.add_argument('--evaluate_final_only', action=argparse.BooleanOptionalAction, default=True)
     train_grp.add_argument('--gamma_norm', type=float, default=0.1, help='Norm regularisation weight.')
-    train_grp.add_argument('--gamma_kd', type=float, default=0.5, help='Knowledge‑distillation weight.')
+    train_grp.add_argument('--gamma_kd', type=float, default=0.0, help='Knowledge‑distillation weight.')
     train_grp.add_argument('--kd_type', type=str, default='feat', help='KD type (feat / logit).')
     train_grp.add_argument('--alpha_t', type=float, default=1.0, help='Auxiliary loss weight.')
-    train_grp.add_argument('--gamma_1', type=float, default=1e-4, help='Additional regularisation weight.')
+    train_grp.add_argument('- -gamma_1', type=float, default=1e-4, help='Additional regularisation weight.')
     train_grp.add_argument('--compensate', type=bool, default=True)
+    train_grp.add_argument('--eval_only', type=bool, default=True)
 
     # ------------------------------------------------------------------
     # 辅助数据集参数
     # ------------------------------------------------------------------
     aux = parser.add_argument_group('auxiliary', 'External / auxiliary dataset')
-    aux.add_argument('--auxiliary_data_path', type=str, default='/data1/open_datasets/ImageNet-2012/train/', help='Root path of the auxiliary dataset.')
-    aux.add_argument('--aux_dataset_type', type=str, default='imagenet', help='Dataset type for auxiliary data (e.g. imagenet, cifar).')
-    aux.add_argument('--auxiliary_data_size', type=int, default=2048, help='Number of samples drawn from the auxiliary dataset each epoch.')
+    aux.add_argument('--auxiliary_data_path', type=str, default='D:/projects/datasets/flickr8k', help='Root path of the auxiliary dataset.')
+    aux.add_argument('--aux_dataset', type=str, default='flickr8k', help='Dataset type for auxiliary data (e.g. imagenet, cifar).', choices=['imagenet', 'flickr8k'])
+    aux.add_argument('--auxiliary_data_size', type=int, default=512, help='Number of samples drawn from the auxiliary dataset each epoch.')
 
     # ------------------------------------------------------------------
     # 正则化 / L2‑Protection
     # ------------------------------------------------------------------
     reg = parser.add_argument_group('regularisation', 'Extra regularisation terms') 
     reg.add_argument('--l2_protection', action='store_true', default=True, help='Enable L2‑protection between the current and previous network.')
-    reg.add_argument('--l2_protection_lambda', type=float, default=1e-2, help='Weight for the L2‑protection term (higher → stronger regularisation). When `--l2_protection` is off, this will be automatically set to 0.0.')
+    reg.add_argument('--l2_protection_lambda', type=float, default=1e-5, help='Weight for the L2‑protection term (higher → stronger regularisation). When `--l2_protection` is off, this will be automatically set to 0.0.')
 
     return parser
 
@@ -155,11 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
 # --------------------------------------------------------------
 # In[]
 if __name__ == '__main__':
-    # os.environ['CUDA_VISIBLE_DEVICES'] = '0'          # 只使用第一块 GPU（可自行修改）
     parser = build_parser()
     args = parser.parse_args()
-
     args = set_smart_defaults(args)
-
     args = vars(args)
     main(args)

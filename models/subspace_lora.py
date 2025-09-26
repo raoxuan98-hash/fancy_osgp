@@ -18,14 +18,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from models.base import BaseLearner
 from models.sldc_modules import Drift_Compensator
 from utils.inc_net import BaseNet
 from lora import compute_covariances
 from collections import namedtuple
-
+import math 
 # ----------------------------------------------------------------------
 #  Loss utilities
 # ----------------------------------------------------------------------
@@ -35,18 +35,11 @@ def symmetric_cross_entropy_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     sce_a: float = 0.5,
-    sce_b: float = 0.5,
-) -> torch.Tensor:
-    """
-    SCE = a·CE + b·Reverse‑CE.
+    sce_b: float = 0.5) -> torch.Tensor:
 
-    The implementation aggressively re‑uses the log‑softmax and softmax
-    tensors to avoid an extra softmax/log call pair.
-    """
     logsoftmax = F.log_softmax(logits, dim=1)
     softmax = logsoftmax.exp()
 
-    # one‑hot labels, very small values are guaranteed by torch
     oh = F.one_hot(targets, num_classes=logits.size(1)).float()
     oh = torch.clamp(oh, min=1e-4, max=1.0)
 
@@ -54,33 +47,14 @@ def symmetric_cross_entropy_loss(
     rce = -(softmax * oh).sum(dim=1).mean()
     return sce_a * ce + sce_b * rce
 
-
 def feature_distillation_loss(
-    teacher_feat: torch.Tensor, student_feat: torch.Tensor
-) -> torch.Tensor:
+    teacher_feat: torch.Tensor, student_feat: torch.Tensor) -> torch.Tensor:
     """L2 distance between teacher and student feature maps."""
     return ((teacher_feat - student_feat) ** 2).mean()
-
 
 def cosine_similarity_loss(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     """1 – cosine similarity, averaged over the batch."""
     return (1.0 - F.cosine_similarity(x1, x2, dim=-1)).mean()
-
-
-def soft_distillation_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    T: float = 2.0,
-) -> torch.Tensor:
-    """KL‑divergence between softened student / teacher logits."""
-    s = F.log_softmax(student_logits / T, dim=1)
-    t = F.softmax(teacher_logits / T, dim=1)
-    return F.kl_div(s, t, reduction="batchmean") * (T ** 2)
-
-
-EvalResult = namedtuple("EvalResult", ["original_fc", "linear_fc"])
-
-
 # ----------------------------------------------------------------------
 #  Main learner
 # ----------------------------------------------------------------------
@@ -91,7 +65,6 @@ class Timing:
     train: float = 0.0
     drift: float = 0.0
     total: float = 0.0
-
 
 class SubspaceLoRA(BaseLearner):
     def __init__(self, args: Dict[str, Any]) -> None:
@@ -116,21 +89,15 @@ class SubspaceLoRA(BaseLearner):
             except Exception as e:
                 logging.warning(f"torch.compile failed: {e}")
 
-
-        # ------------------------------------------------------------------
-        #  Checkpoint / bookkeeping
-        # ------------------------------------------------------------------
         self._timings: Timing = Timing()
         self.time_history: List[Dict[str, float]] = []
 
-        # ------------------------------------------------------------------
-        #  Hyper‑parameters
-        # ------------------------------------------------------------------
         self.sce_a: float = args["sce_a"]
         self.sce_b: float = args["sce_b"]
 
         self.batch_size: int = args["batch_size"]
-        self.epochs: int = args["epochs"]
+        self.iterations: int = args["iterations"]
+        self.warmup_steps: int = args["warmup_steps"]
         self.ca_epochs: int = args["ca_epochs"]
         self.lrate: float = args["lrate"]
         self.weight_decay: float = args["weight_decay"]
@@ -156,22 +123,12 @@ class SubspaceLoRA(BaseLearner):
         self.gamma_norm: float = args["gamma_norm"]
         self.gamma_prior: float = args["kl_gamma"]
 
-        # ------------------------------------------------------------------
-        #  Projection / L2 protection
-        # ------------------------------------------------------------------
         self.l2_protection: bool = args["l2_protection"]
         self.l2_lambda: float = args["l2_protection_lambda"]
 
         self.covariances: Dict[str, torch.Tensor] | None = None
-
-        # ------------------------------------------------------------------
-        #  Drift compensator
-        # ------------------------------------------------------------------
         self.drift_compensator = Drift_Compensator(args)
 
-        # ------------------------------------------------------------------
-        #  Other bookkeeping
-        # ------------------------------------------------------------------
         self.prev_params: Dict[str, torch.Tensor] | None = None
         self.prev_network: BaseNet | None = None
         self.original_fc: nn.Module | None = None
@@ -181,11 +138,7 @@ class SubspaceLoRA(BaseLearner):
         self.task_count: int = 0
 
         self._eval_tasks: set[int] = set()
-
-
-        logging.info(
-            f"Optimizer instantiated: lrate={self.lrate}, "
-            f"wd={self.weight_decay}, optimizer={self.optimizer_type}")
+        logging.info(f"Optimizer instantiated: lrate={self.lrate}, wd={self.weight_decay}, optimizer={self.optimizer_type}")
 
     # ------------------------------------------------------------------
     #  Check‑point utilities
@@ -193,18 +146,21 @@ class SubspaceLoRA(BaseLearner):
     def save_checkpoint(self, prefix: str) -> None:
         """Save trainable parameters after the current task."""
         param_dict = {
-            n: p.detach().cpu() for n, p in self.network.named_parameters() if p.requires_grad
-        }
+            n: p.detach().cpu() for n, p in self.network.named_parameters() if p.requires_grad}
+        
         payload = {"task": self._cur_task, "model_state_dict": param_dict}
-        path = f"{prefix}_after_task_{self._cur_task}.pth"
+        path = f"{prefix}/after_task_{self._cur_task}.pth"
         torch.save(payload, path)
         logging.info(f"Checkpoint saved to: {path}")
 
+    def load_checkpoint(self, prefix: str) -> None:
+        """Save trainable parameters after the current task."""
+        path = f"{prefix}/after_task_{self._cur_task}.pth"
+        param_dict = torch.load(path)['model_state_dict']
+        self.network.load_state_dict(param_dict, strict=False)
+        logging.info(f"Checkpoint loaded from: {path}")
+
     def _compute_eval_milestones(self, nb_tasks: int) -> set[int]:
-        """
-        Return a set of task indices (1-based) at ~40%, ~70%, and 100%
-        of the total number of tasks. We use ceil to avoid 0.
-        """
         import math
         raw = [math.ceil(nb_tasks * 0.4), math.ceil(nb_tasks * 0.7), nb_tasks]
         return set(min(max(1, t), nb_tasks) for t in raw)
@@ -215,36 +171,25 @@ class SubspaceLoRA(BaseLearner):
         drift_start = time.time()
 
         # Update drift compensator stats
-        self.drift_compensator.update_stats(
+        self.drift_compensator.build_all_variants(
             self._cur_task,
             self.prev_network.vit,
             self.network.vit,
-            self.train_loader_test_mode,
-            self.compensate)
+            self.train_loader_test_mode)
 
         # Record the drift compensation time
         self._timings.drift = time.time() - drift_start
 
     def refine_classifiers(self):
         # Optionally refine the classifiers based on drift compensation
-        fc_dict = self.drift_compensator.refine_classifiers(self.network.fc, self._cur_task, self.ca_epochs)
-        self.original_fc = fc_dict["original"]
-        self.linear_fc = fc_dict["linear_compensate"]
-        logging.info(f"Refining classifiers at milestone task {self._cur_task} / {self.data_manager.nb_tasks}")
+        self.fc_dict = self.drift_compensator.refine_classifiers_from_variants(self.network.fc, self._cur_task, self.ca_epochs)
 
-
-    # ------------------------------------------------------------------
-    #  Task‑level bookkeeping
-    # ------------------------------------------------------------------
     def after_task(self) -> None:
         """Update class counters after finishing a task."""
         self._known_classes = self._total_classes
         self.update_projection_matrices()
         self.task_count += 1
 
-    # ------------------------------------------------------------------
-    #  Incremental training driver (public API)
-    # ------------------------------------------------------------------
     def incremental_train(self, data_manager) -> None:
         """Entry‑point for training on a new task."""
         start_time = time.time()
@@ -258,40 +203,51 @@ class SubspaceLoRA(BaseLearner):
         train_set = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
             source="train",
-            mode="train",
-        )
+            mode="train")
         
         test_set = data_manager.get_dataset(
-            np.arange(0, self._total_classes), source="test", mode="test"
-        )
+            np.arange(0, self._total_classes), source="test", mode="test")
+        
         train_set_test_mode = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
             source="train",
-            mode="test",
-        )
+            mode="test")
 
-        # ---- 2️⃣  DataLoaders ------------------------------------------------
         self.train_loader = DataLoader(
             train_set,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=3,
             pin_memory=True,
-        )
+            persistent_workers=True)
+        
         self.test_loader = DataLoader(
             test_set,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=3,
             pin_memory=True,
-        )
+            persistent_workers=True)
+        
+        dataset_size = len(train_set_test_mode)
+        max_samples = getattr(self, 'max_train_test_samples', 1000)  # 默认采样1000个样本，可配置
+
+        sampler = None
+        if dataset_size > max_samples:
+            # 随机采样 max_samples 个样本索引
+            indices = torch.randperm(dataset_size)[:max_samples].tolist()
+            sampler = SubsetRandomSampler(indices)
+            print(f"⚠️ Dataset too large ({dataset_size}), sampling {max_samples} examples for test-mode training set.")
+
+        # 创建 DataLoader，注意：使用 sampler 时 shuffle 必须为 False
         self.train_loader_test_mode = DataLoader(
             train_set_test_mode,
             batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=4,
+            shuffle=False if sampler else True,  # 有 sampler 时不能 shuffle
+            sampler=sampler,
+            num_workers=3,
             pin_memory=True,
-        )
+            persistent_workers=True)
 
         # ---- 3️⃣  keep a copy of the model before training ------------------
         self.prev_network = copy.deepcopy(self.network).to(self._device)
@@ -305,12 +261,16 @@ class SubspaceLoRA(BaseLearner):
 
         # ---- 5️⃣  system‑level training (backbone + head) --------------------
         logging.info(
-            "System training on classes %d‑%d (%s)",
+            "System training on classes %d-%d (%s)",
             self._known_classes,
             self._total_classes,
             data_manager.dataset_name.lower())
         
-        self._system_training(self.train_loader)
+        if self.args['eval_only']:
+            self.load_checkpoint(self.args["log_path"])
+        else:
+            self._system_training(self.train_loader)
+            self.save_checkpoint(self.args["log_path"])
 
         # ---- 6️⃣  drift compensation -----------------------------------------
         self.handle_drift_compensation()
@@ -328,13 +288,11 @@ class SubspaceLoRA(BaseLearner):
     
     # ------------------------------------------------------------------
     #  Optimiser factory
-    # ------------------------------------------------------------------
     def _make_optimizer(
         self,
         lora_params: List[torch.nn.Parameter],
         fc_params: List[torch.nn.Parameter],
-        osgp_params: List[torch.nn.Parameter] | None = None,
-    ) -> optim.Optimizer:
+        osgp_params: List[torch.nn.Parameter] | None = None) -> optim.Optimizer:
         """Create optimizer according to ``self.optimizer_type``."""
         if osgp_params is None:
             param_groups = [
@@ -369,13 +327,45 @@ class SubspaceLoRA(BaseLearner):
             ]
 
         if self.optimizer_type == "sgd":
-            return optim.SGD(param_groups, momentum=0.9)
-        if self.optimizer_type == "adamw":
-            return optim.AdamW(param_groups)
-        if self.optimizer_type == "rmsprop":
-            return optim.RMSprop(param_groups)
-        raise ValueError(f"Unsupported optimizer type: {self.optimizer_type}")
+            optimizer = optim.SGD(param_groups, momentum=0.9)
+        elif self.optimizer_type == "adamw":
+            optimizer = optim.AdamW(param_groups)
+        elif self.optimizer_type == "rmsprop":
+            optimizer = optim.RMSprop(param_groups)
+        else:
+            raise ValueError(f"Unsupported optimizer: {self.optimizer_type}")
 
+        if self.warmup_steps > 0:
+            base_lr = self.lrate
+
+            # 定义每个参数组的学习率调度函数
+            def lora_lr_lambda(step):
+                if step < self.warmup_steps:
+                    return float(step) / float(max(1, self.warmup_steps))  # 0 → 1
+                else:
+                    # 余弦退火：从 1.0 → 0.5
+                    progress = (step - self.warmup_steps) / max(1, self.iterations - self.warmup_steps)
+                    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1.0 → 0.0
+                    return 0.5 + 0.5 * cosine_decay  # 1.0 → 0.5
+
+            # fc 和 osgp 保持恒定学习率（乘以 1.0）
+            def const_lr_lambda(step):
+                return 1.0
+
+            # 构造 lr_lambda 列表：每个 param_group 一个函数
+            lr_lambdas = [lora_lr_lambda]  # group 0: lora
+            lr_lambdas.append(const_lr_lambda)  # group 1: fc
+            if osgp_params is not None:
+                lr_lambdas.append(const_lr_lambda)  # group 2: osgp
+
+            scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambdas, last_epoch=-1)
+
+        else:
+            # 无 warmup：所有参数组使用统一 cosine 调度
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.iterations, eta_min=self.lrate * 0.5)
+
+        return optimizer, scheduler
     # ------------------------------------------------------------------
     #  L2‑Protection helpers
     # ------------------------------------------------------------------
@@ -389,8 +379,7 @@ class SubspaceLoRA(BaseLearner):
         self.prev_params = {
             name: p.clone().detach()
             for name, p in self.network.named_parameters()
-            if p.requires_grad and "fc" not in name
-        }
+            if p.requires_grad and "fc" not in name}
 
     def _l2_protection_loss(self) -> torch.Tensor:
         """L2‑penalty that keeps current weights close to the snapshot."""
@@ -421,73 +410,54 @@ class SubspaceLoRA(BaseLearner):
             osgp_params = None
             lora_params = [p for p in self.network.vit.parameters() if p.requires_grad]
 
-        optimizer = self._make_optimizer(lora_params, fc_params, osgp_params)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.epochs, eta_min=self.lrate / 2)
-
+        optimizer, scheduler = self._make_optimizer(lora_params, fc_params, osgp_params)
         start = time.time()
-        for epoch in range(1, self.epochs + 1):
-            self._train_one_epoch(train_loader, optimizer, epoch)
-            scheduler.step()
+        self.network.train()
+        
+        done = False
+        step = 1
+        while True:
+            for batch in self.train_loader:
+                inputs, targets = batch[1], batch[2]
+                loss, n_corr, kd_term, prior_term = self.process_batch(inputs, targets, optimizer)
+
+                if step == 1:
+                    total_loss = loss
+                    total_kd_loss = kd_term
+                    total_prior_loss = prior_term
+                    total_correct = n_corr/inputs.size(0)
+                else:
+                    total_loss = 0.9*total_loss + 0.1*loss
+                    total_kd_loss = 0.9*total_kd_loss + 0.1*kd_term
+                    total_prior_loss = 0.9*total_prior_loss + 0.1*prior_term
+                    total_correct = 0.9*total_correct + 0.1*n_corr/inputs.size(0)
+
+                if step % 10 == 0:
+                    logging.info('step: %d, loss: %.4f, kd_loss: %.4f, prior_loss: %.4f, acc: %.4f' % (step, total_loss, total_kd_loss, total_prior_loss, total_correct))
+    
+                scheduler.step()
+                step += 1
+
+                if step == self.iterations:
+                    done = True
+                    break
+
+            if done:
+                break
+
         self._timings.train = time.time() - start
 
-    # ------------------------------------------------------------------
-    #  Epoch‑wise training
-    # ------------------------------------------------------------------
-    def _train_one_epoch(
-        self,
-        loader: DataLoader,
-        optimizer: optim.Optimizer,
-        epoch_id: int,
-    ) -> None:
-        self.network.train()
-        total_loss, correct, n_samples = 0.0, 0, 0
-
-        total_kd_loss, total_prior_loss = 0.0, 0.0
-
-        for batch_idx, (_, inputs, targets) in enumerate(loader):
-            loss, n_corr, kd_term, prior_term = self._process_batch(
-                inputs, targets, optimizer
-            )
-            total_loss += loss
-            correct += n_corr
-            n_samples += targets.size(0)
-
-            total_kd_loss += kd_term
-            total_prior_loss += prior_term
-
-        avg_loss = total_loss / len(loader)
-        accuracy = correct / n_samples
-
-        msg = (
-            f"Task {self._cur_task} – Epoch {epoch_id}/{self.epochs} – "
-            f"Loss: {avg_loss:.7f} – Acc: {accuracy:.7f}"
-        )
-        if self.use_feature_kd and self._cur_task > 0:
-            avg_kd = total_kd_loss / len(loader)
-            msg += f" – Avg KD loss: {avg_kd / self.args['gamma_kd']:.7f}"
-        avg_prior = total_prior_loss / len(loader)
-        msg += f" – Avg Prior loss: {avg_prior / self.args['kl_gamma']:.7f}"
-        logging.info(msg)
-
-    # ------------------------------------------------------------------
-    #  Process single batch (forward → loss → backward → step)
-    # ------------------------------------------------------------------
-    def _process_batch(
+    def process_batch(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
-        optimizer: optim.Optimizer,
-    ) -> Tuple[float, int, float, float]:
+        optimizer: optim.Optimizer) -> Tuple[float, int, float, float]:
         inputs, targets = inputs.to(self._device), targets.to(self._device)
 
         # Forward with autocast (auto‑mixed precision)
         feats = self.network.vit(inputs)          # (B, D)
         logits = self.network.fc(feats)           # (B, C)
 
-        # ------------------------------------------------------------------
-        #  Knowledge Distillation
-        # ------------------------------------------------------------------
         kd_term = 0.0
         if self.use_feature_kd and self._cur_task > 0:
             with torch.no_grad():
@@ -497,57 +467,32 @@ class SubspaceLoRA(BaseLearner):
             kd_norm = self._norm_loss(prev_feats, feats)
             kd_term = self.gamma_kd * kd_feat + self.gamma_norm * kd_norm
 
-        # ------------------------------------------------------------------
-        #  SCE on newly introduced classes
-        # ------------------------------------------------------------------
         new_targets_rel = torch.where(
             targets - self._known_classes >= 0,
-            targets - self._known_classes,
-            -100,
-        )
+            targets - self._known_classes, -100)
         new_logits = logits[:, self._known_classes :]
         
         sce = symmetric_cross_entropy_loss(
-            new_logits, new_targets_rel, self.sce_a, self.sce_b
-        )
+            new_logits, new_targets_rel, self.sce_a, self.sce_b)
 
-        # ------------------------------------------------------------------
-        #  L2‑Protection & Prior
-        # ------------------------------------------------------------------
         l2_term = self._l2_protection_loss()
         prior_term = self.network.vit.kl_regularization()
-
-        # prior_term = self.network.vit.directional_reg()
-
-        # ------------------------------------------------------------------
-        #  Total loss & optimisation step
-        # ------------------------------------------------------------------
         loss = sce + kd_term + l2_term + prior_term
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # ------------------------------------------------------------------
-        #  Statistics
-        # ------------------------------------------------------------------
         with torch.no_grad():
             pred = logits.argmax(dim=1)
             n_correct = (pred == targets).sum().item()
 
         # Return scalar loss + raw KD / prior contributions (for logging)
-        kd_raw = (
-            kd_term.item() / self.gamma_kd
-            if isinstance(kd_term, torch.Tensor) and self.gamma_kd != 0
-            else float(kd_term)
-        )
+        kd_raw = (kd_term.item() / self.gamma_kd if isinstance(kd_term, torch.Tensor) and self.gamma_kd != 0 else float(kd_term))
         prior_raw = (prior_term.item() if isinstance(prior_term, torch.Tensor) else float(prior_term))
         
         return loss.item(), n_correct, kd_raw, prior_raw
 
-    # ------------------------------------------------------------------
-    #  Helper for norm‑based KD (used together with feature KD)
-    # ------------------------------------------------------------------
     @staticmethod
     def _norm_loss(t_feat: torch.Tensor, s_feat: torch.Tensor) -> torch.Tensor:
         """MSE between L2‑norms of teacher / student feature vectors."""
@@ -555,56 +500,49 @@ class SubspaceLoRA(BaseLearner):
         s_norm = s_feat.norm(p=2, dim=1)
         return F.mse_loss(t_norm, s_norm)
 
-    # ------------------------------------------------------------------
-    #  Evaluation utilities
-    # ------------------------------------------------------------------
     def evaluate(
         self,
         loader: DataLoader,
-        original_fc: nn.Module | None = None,
-        linear_fc: nn.Module | None = None,
-    ) -> EvalResult:
+        fc_dict):
+
         """Run inference on ``loader`` and report accuracy for both classifiers."""
         self.network.eval()
         total = 0
-        correct_orig, correct_lin = 0, 0
+        corrects = {}
+        for name, fc in fc_dict.items():
+            corrects[name] = 0
 
         with torch.no_grad():
             for _, (_, inputs, targets) in enumerate(loader):
                 inputs = inputs.to(self._device)
                 feats = self.network.vit(inputs)
 
-                if original_fc is not None:
-                    preds = original_fc(feats).argmax(dim=1).cpu()
-                    correct_orig += (preds == targets).sum().item()
-
-                if linear_fc is not None:
-                    preds = linear_fc(feats).argmax(dim=1).cpu()
-                    correct_lin += (preds == targets).sum().item()
+                for name, fc in fc_dict.items():
+                    preds = fc(feats).argmax(dim=1).cpu()
+                    corrects[name] += (preds == targets).sum().item()
 
                 total += targets.size(0)
+            
+        for name, correct in corrects.items():
+            corrects[name] = float(np.around(100 * correct / total, 2))
+        
+        return corrects
 
-        def _pct(correct: int) -> float:
-            return float(np.around(100.0 * correct / total, 2))
-
-        return EvalResult(original_fc=_pct(correct_orig), linear_fc=_pct(correct_lin))
-
-    def eval_task(self) -> EvalResult:
+    def eval_task(self):
         """Evaluate the current task using both classifiers."""
         
         results = self.evaluate(
             self.test_loader,
-            original_fc=self.original_fc,
-            linear_fc=self.linear_fc,
-        )
+            fc_dict=self.fc_dict)
 
-        logging.info(
-            f"Task {self._cur_task} – Eval → Orig: {results.original_fc:.2f}%, "
-            f"Compensated: {results.linear_fc:.2f}%"
-        )
+        # 动态格式化输出所有分类器的结果
+        result_str = ", ".join([f"{name}: {acc:.2f}%" for name, acc in results.items()])
+        logging.info(f"Task {self._cur_task} – Eval → {result_str}")
+
         if not hasattr(self, "all_task_results"):
-            self.all_task_results: Dict[int, EvalResult] = {}
-        self.all_task_results[self._cur_task] = results
+            self.all_task_results: Dict[int, Dict[str, float]] = {}
+        self.all_task_results[self._cur_task] = results  # 保存整个字典
+
         return results
 
     # ------------------------------------------------------------------
@@ -617,12 +555,8 @@ class SubspaceLoRA(BaseLearner):
 
             if self.covariances is None:
                 self.covariances = new_covs
-                # print(1)
             else:
                 for k in self.covariances:
-                    # print(0.9 * self.covariances[k].diag().mean())
-                    # print(0.3 * self.covariances[k].diag().mean())
-                    # print("________")
                     self.covariances[k] = 0.9 * self.covariances[k] + new_covs[k]
 
             self.network.vit.update_projection_matrices(new_covs)
@@ -642,13 +576,9 @@ class SubspaceLoRA(BaseLearner):
 
         for _ in range(data_manager.nb_tasks):
             self.incremental_train(data_manager)
-            if (self._cur_task + 1) in self._eval_tasks:
-                self.refine_classifiers()
-                logging.info(f"Evaluating after task {self._cur_task}...")
-                task_res = self.eval_task()
-                agg["original_fc"].append(task_res.original_fc)
-                agg["linear_fc"].append(task_res.linear_fc)
-
+            # if (self._cur_task + 1) in self._eval_tasks:
+            self.refine_classifiers()
+            logging.info(f"Evaluating after task {self._cur_task}...")
+            task_res = self.eval_task()
             self.after_task()
-
-        return agg
+        return task_res

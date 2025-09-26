@@ -19,7 +19,6 @@ def train(args):
     for run_id, seed in enumerate(args['seed_list']):
         args['seed'], args['run_id'] = seed, run_id
         args['device'] = device
-        
         logfile_head, logfile_name = build_log_dirs(args)
         args['log_path'] = logfile_name
         logging.basicConfig(
@@ -28,8 +27,9 @@ def train(args):
             handlers=[
                 logging.FileHandler(filename=os.path.join(logfile_name, 'record.log')),
                 logging.StreamHandler(sys.stdout)
-            ]
-        )
+            ])
+        
+        args['log_path'] = logfile_name
         results = train_single_run(args)
         all_results[f"seed_{seed}"] = results
         
@@ -126,8 +126,7 @@ def Bayesian_evaluate(args):
         shuffle=args['shuffle'],
         seed=args['seed'],
         init_cls=args['init_cls'],
-        increment=args['increment']
-    )
+        increment=args['increment'])
     
     model = SubspaceLoRA(args)
     logging.info(f'All params: {count_parameters(model.network)}')
@@ -276,8 +275,7 @@ def build_log_dirs(args: dict):
     logfile_name = os.path.join(
         logfile_head,
         f"{log_suffix}_optim-{args['optimizer']}_lr-{_fmt(args['lrate'])}"
-        f"_bz-{args['batch_size']}_epoch-{args['epochs']}_seed-{args['seed']}"
-    )
+        f"_bz-{args['batch_size']}_iter-{args['iterations']}_seed-{args['seed']}")
 
     # 创建目录
     os.makedirs(logfile_head, exist_ok=True)
