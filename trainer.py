@@ -8,14 +8,11 @@ from models.subspace_lora import SubspaceLoRA
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
 
+
 def train(args):
-    # Set device and seed for randomness upfront
     device = set_device(args['device'])
     all_results = {}
     
-    # 用于存储最终结果的列表
-    original_fc_final = []
-    linear_fc_final = []
     for run_id, seed in enumerate(args['seed_list']):
         args['seed'], args['run_id'] = seed, run_id
         args['device'] = device
@@ -26,44 +23,12 @@ def train(args):
             format='%(asctime)s [%(filename)s] => %(message)s',
             handlers=[
                 logging.FileHandler(filename=os.path.join(logfile_name, 'record.log')),
-                logging.StreamHandler(sys.stdout)
-            ])
+                logging.StreamHandler(sys.stdout)])
         
         args['log_path'] = logfile_name
         results = train_single_run(args)
         all_results[f"seed_{seed}"] = results
-        
-        # 收集最终结果
-        original_fc_final.append(results['original_fc'][-1])
-        linear_fc_final.append(results['linear_fc'][-1])
-    # 计算平均值和标准差
-    original_fc_mean = np.mean(original_fc_final)
-    original_fc_std = np.std(original_fc_final)
-    linear_fc_mean = np.mean(linear_fc_final)
-    linear_fc_std = np.std(linear_fc_final)
-    
-    # 打印每个种子的结果
-    for seed, results in all_results.items():
-        print(f"Seed {seed}:")
-        print(f"  Original FC: {results['original_fc'][-1]:.2f}%")
-        print(f"  Linear FC: {results['linear_fc'][-1]:.2f}%")
-    
-    # 打印并记录平均值和标准差
-    summary_msg = f"\nSummary across {len(args['seed_list'])} seeds:"
-    summary_msg += f"\n  Original FC: {original_fc_mean:.2f}% ± {original_fc_std:.2f}%"
-    summary_msg += f"\n  Linear FC: {linear_fc_mean:.2f}% ± {linear_fc_std:.2f}%"
-    
-    print(summary_msg)
-    logging.info(summary_msg)
-    
-    # 将汇总结果也添加到all_results中
-    all_results['summary'] = {
-        'original_fc_mean': original_fc_mean,
-        'original_fc_std': original_fc_std,
-        'linear_fc_mean': linear_fc_mean,
-        'linear_fc_std': linear_fc_std,
-        'num_seeds': len(args['seed_list'])
-    }
+    aggregate_seed_results(all_results)
     return all_results
 
 def train_single_run(args):
@@ -77,16 +42,14 @@ def train_single_run(args):
         shuffle=args['shuffle'],
         seed=args['seed'],
         init_cls=args['init_cls'],
-        increment=args['increment'],
-        args=args
-    )
+        increment=args['increment'])
     
     model = SubspaceLoRA(args)
     logging.info(f'All params: {count_parameters(model.network)}')
     logging.info(f'Trainable params: {count_parameters(model.network, True)}')
-
     final_results = model.loop(data_manager)
     return final_results
+
 
 def Bayesian_evaluate(args):
     """
@@ -207,52 +170,30 @@ def _fmt(x, *, digits=4):
 
 # --------- NEW: build log head & name based on args ----------
 def build_log_dirs(args: dict):
-    """
-    根据数据集、ViT、LoRA 类型与关键超参构建日志目录层级。
-    结构：
-      {model_name}_logs_{user}/
-        {dataset}_{vit_type}/
-          {init/inc + lora关键参}/
-            optim-..._lr-..._bz-..._epoch-..._seed-...
-    """
-    # 顶层与二级目录（不变）
     logfile_head = os.path.join(
         f"{args['model_name']}_logs_{args['user']}",
-        f"{args['dataset']}_{args['vit_type']}"
-    )
+        f"{args['dataset']}_{args['vit_type']}")
 
     # ---- 关键：在第三层目录揉入 LoRA 相关核心超参 ----
     base_tags = [
         f"init-{args['init_cls']}",
         f"inc-{args['increment']}",
         f"rank-{args.get('lora_rank', 'NA')}",
-        f"lt-{args.get('lora_type', 'NA')}",
-    ]
+        f"lt-{args.get('lora_type', 'NA')}"]
 
-    # 某些公共但重要的控制项（按需保留，避免太长）
-    # 投影温度对 SGP/OSGP 都重要：
-    if 'proj_temp' in args:
-        base_tags.append(f"T-{_fmt(args['proj_temp'])}")
 
-    # 是否启用 classifier compensate
+    if 'weight_temp' in args:
+        base_tags.append(f"T-{_fmt(args['weight_temp'])}")
+
     if 'compensate' in args:
         base_tags.append(f"comp-{_fmt(args['compensate'])}")
 
-    # LoRA 类型专属参数
     lora_type = args.get('lora_type', '')
     if lora_type in ('sgp_lora', 'osgp_lora'):
         if 'weight_kind' in args:
             base_tags.append(f"wk-{args['weight_kind']}")
         if 'weight_p' in args:
             base_tags.append(f"wp-{_fmt(args['weight_p'])}")
-        if 'trace_k' in args:
-            base_tags.append(f"tk-{_fmt(args['trace_k'])}")
-
-    if lora_type == 'osgp_lora':
-        if 'kl_gamma' in args:
-            base_tags.append(f"klg-{_fmt(args['kl_gamma'])}")
-        if 'osgp_scale' in args:
-            base_tags.append(f"scale-{_fmt(args['osgp_scale'])}")
 
     if lora_type == 'nsp_lora':
         if 'nsp_eps' in args:
@@ -260,7 +201,6 @@ def build_log_dirs(args: dict):
         if 'nsp_weight' in args:
             base_tags.append(f"nw-{_fmt(args['nsp_weight'])}")
 
-    # KD / 正则（如果与你的实验常变动，也可以加进去）
     if 'kd_type' in args:
         base_tags.append(f"kd-{args['kd_type']}")
     if 'gamma_kd' in args:
@@ -282,3 +222,56 @@ def build_log_dirs(args: dict):
     os.makedirs(logfile_name, exist_ok=True)
 
     return logfile_head, logfile_name
+
+def aggregate_seed_results(seed_results):
+    if not seed_results:
+        logging.warning("⚠️ No seed results provided for aggregation.")
+        return {"final_task": {}, "average_across_tasks": {}}
+
+    # Collect all variant names across all seeds
+    all_variants = set()
+    for res in seed_results:
+        all_variants.update(res.get("last_task_accuracies", {}).keys())
+        all_variants.update(res.get("average_accuracies", {}).keys())
+    all_variants = sorted(all_variants)
+
+    # Initialize containers
+    final_task_values = {variant: [] for variant in all_variants}
+    avg_task_values = {variant: [] for variant in all_variants}
+
+    # Populate with data from each seed
+    for res in seed_results:
+        last_acc = res.get("last_task_accuracies", {})
+        avg_acc = res.get("average_accuracies", {})
+
+        for variant in all_variants:
+            final_task_values[variant].append(last_acc.get(variant, 0.0))
+            avg_task_values[variant].append(avg_acc.get(variant, 0.0))
+
+    # Compute mean and std
+    final_task_stats = {}
+    avg_task_stats = {}
+
+    for variant in all_variants:
+        f_vals = np.array(final_task_values[variant])
+        a_vals = np.array(avg_task_values[variant])
+
+        final_task_stats[variant] = (float(np.mean(f_vals)), float(np.std(f_vals)))
+        avg_task_stats[variant] = (float(np.mean(a_vals)), float(np.std(a_vals)))
+
+    # === 📊 Log Aggregated Results ===
+    logging.info("📈 Aggregated Results Across Random Seeds:")
+    logging.info("  ── Final Task Accuracy (Mean ± Std) ──")
+    for variant in all_variants:
+        mean, std = final_task_stats[variant]
+        logging.info(f"      {variant:<20} : {mean:.2f}% ± {std:.2f}%")
+
+    logging.info("  ── Average Accuracy Across Tasks (Mean ± Std) ──")
+    for variant in all_variants:
+        mean, std = avg_task_stats[variant]
+        logging.info(f"      {variant:<20} : {mean:.2f}% ± {std:.2f}%")
+
+    # Return structured stats
+    return {
+        "final_task": final_task_stats,
+        "average_across_tasks": avg_task_stats}

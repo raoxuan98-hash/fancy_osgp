@@ -1,43 +1,7 @@
-# -*- coding: utf-8 -*-
-"""
-SLDC experiments unified management – 参数分组版（每条 add_argument 为单行）
-
-Author:  <your name>
-Date:    2025‑08‑17
-"""
 
 import argparse
 import os
-from trainer import train
-
-# --------------------------------------------------------------
-# 1️⃣  Smart defaults（根据数据集自动调节若干超参）
-# --------------------------------------------------------------
-def set_smart_defaults(ns):
-    """在开启 ``--smart_defaults`` 时，根据数据集覆盖部分默认值。"""
-    if not ns.smart_defaults:
-        return ns
-    if ns.dataset == 'cars196_224':
-        ns.init_cls, ns.increment, ns.epochs = 20, 20, 15
-    elif ns.dataset == 'imagenet-r':
-        ns.init_cls, ns.increment, ns.epochs = 20, 20, 10
-    elif ns.dataset == 'cifar100_224':
-        ns.init_cls, ns.increment, ns.epochs = 10, 10, 5
-    elif ns.dataset == 'cub200_224':
-        ns.init_cls, ns.increment, ns.epochs = 20, 20, 15
-    
-    if not args.l2_protection:
-        args.l2_protection_lambda = 0.0
-
-    if args.lora_type == 'full':
-        args.lrate = 1e-3
-        args.optimizer = 'sgd'
-        args.head_scale = 1.0
-
-    if args.test:
-        args.seed_list = [1993] 
-
-    return ns
+from trainer_clip import train
 
 
 # --------------------------------------------------------------
@@ -53,7 +17,7 @@ def main(args):
 # --------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='SLDC experiments unified management (grouped arguments).',
+        description='SGP-LoRA experiments unified management (grouped arguments).',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # ------------------------------------------------------------------
@@ -61,14 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     # ------------------------------------------------------------------
     basic = parser.add_argument_group('basic', 'General / high‑level options')
     basic.add_argument('--smart_defaults', action='store_true', default=False, help='If set, overwrite a few hyper‑parameters according to the dataset.')
+    basic.add_argument('--dataset', type=str, default='CLIP-CL')
     basic.add_argument('--prefix', type=str, default='original', help='Prefix for output folders / logs.')
     basic.add_argument('--test', action=argparse.BooleanOptionalAction, default=False, help='Run in test mode (single seed, quick).')
     basic.add_argument('--user', type=str, default='raoxuan', choices=['null'], help='User identifier (currently unused).')
     basic.add_argument('--data_location', type=str, default="/home/raoxuan/projects/SubspaceLoRA/data/mtil")
     basic.add_argument('--reference_dataset_path', type=str, default='/data1/open_datasets/ImageNet-2012/train/')
-    basic.add_argument('--reference_batch_size', type=int, default=16)
+    basic.add_argument('--reference_batch_size', type=int, default=24)
     
-
     # ------------------------------------------------------------------
     # Memory 参数
     # ------------------------------------------------------------------
@@ -92,13 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument('--model_name', type=str, default='sldc', help='Model identifier.')
     model.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay.')
     model.add_argument('--device', nargs='+', default=['0'], help='CUDA device ids, e.g. --device 0 1 2')
+    model.add_argument('--vit_type', type=str, default='clip-vit-b-16')
 
     # ------------------------------------------------------------------
     # LoRA
     # ------------------------------------------------------------------
-    model.add_argument('--lora_rank', type=int, default=4, help='LoRA rank.')
+    model.add_argument('--lora_rank', type=int, default=8, help='LoRA rank.')
     model.add_argument('--lora_type', type=str, default="sgp_lora", choices=['basic_lora', 'osgp_lora', 'sgp_lora', 'nsp_lora', 'full'], help='Type of LoRA adaptor.')
-    model.add_argument('--proj_temp', type=float, default=2, help='Projection temperature.')
+    model.add_argument('--weight_temp', type=float, default=4, help='Projection temperature.')
 
     # NSP相关的参数
     model.add_argument('--nsp_eps', type=float, default=0.05, choices=[0.05, 0.10])
@@ -113,41 +78,53 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument('--kl_gamma', type=float, default=1e-2, help='KL‑div weight for projection.')
     model.add_argument('--osgp_scale', type=float, default=1.0, help='Scale factor when using osgp_lora.')
 
-    # ------------------------------------------------------------------
-    # 训练相关参数
-    # ------------------------------------------------------------------
     train_grp = parser.add_argument_group('training', 'Optimisation & schedule')
     train_grp.add_argument('--sce_a', type=float, default=0.5, help='Symmetric cross‑entropy A.')
     train_grp.add_argument('--sce_b', type=float, default=0.5, help='Symmetric cross‑entropy B.')
     train_grp.add_argument('--seed_list', nargs='+', type=int, default=[1993, 1996, 1997], help='Random seeds for multiple runs.')
-    train_grp.add_argument('--epochs', type=int, default=1, help='Training epochs per task.')
+    train_grp.add_argument('--iterations', type=int, default=600, help='Training iterations per task.')
+    train_grp.add_argument('--warmup_steps', type=int, default=0, help='Warm‑up steps.')
     train_grp.add_argument('--ca_epochs', type=int, default=5, help='Class‑augmentation epochs.')
     train_grp.add_argument('--optimizer', type=str, default='adamw', help='Optimizer name (adamw / sgd).')
-    train_grp.add_argument('--lrate', type=float, default=1e-3, help='Learning rate.')
+    train_grp.add_argument('--lrate', type=float, default=3e-4, help='Learning rate.')
     train_grp.add_argument('--head_scale', type=float, default=1.0, help='Scale for the classifier head.')
-    train_grp.add_argument('--batch_size', type=int, default=32, help='Batch size.')
+    train_grp.add_argument('--batch_size', type=int, default=16, help='Batch size.')
     train_grp.add_argument('--evaluate_final_only', action=argparse.BooleanOptionalAction, default=True)
     train_grp.add_argument('--gamma_norm', type=float, default=0.1, help='Norm regularisation weight.')
-    train_grp.add_argument('--gamma_kd', type=float, default=1.0, help='Knowledge‑distillation weight.')
+    train_grp.add_argument('--gamma_kd', type=float, default=0.0, help='Knowledge‑distillation weight.')
     train_grp.add_argument('--kd_type', type=str, default='feat', help='KD type (feat / logit).')
     train_grp.add_argument('--alpha_t', type=float, default=1.0, help='Auxiliary loss weight.')
     train_grp.add_argument('--gamma_1', type=float, default=1e-4, help='Additional regularisation weight.')
     train_grp.add_argument('--compensate', type=bool, default=True)
+    train_grp.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True, help='Enable torch.cuda.amp mixed precision when CUDA is available.')
+    train_grp.add_argument('--amp_dtype', type=str, default='fp16', choices=['fp16', 'bf16'], help='AMP compute dtype to request when mixed precision is enabled.')
 
     # ------------------------------------------------------------------
-    # 辅助数据集参数
+    # CLIP dataset sequence
+    # ------------------------------------------------------------------
+    clip_data = parser.add_argument_group('clip-data', 'CLIP dataset sequencing')
+    clip_data.add_argument('--clip_dataset_sequence', nargs='+', default=['fgvc_aircraft', 'caltech-101', 'dtd', 'eurosat', 'oxford_flower102', 'food101', 'mnist', 'oxford_pets', 'stanford_cars', 'imagenet_r'], help='Dataset names (defined in utils.data1) composing the CLIP incremental tasks.')
+    clip_data.add_argument('--clip_dataset_shuffle', action=argparse.BooleanOptionalAction, default=False, help='Shuffle the dataset order before training.')
+    clip_data.add_argument('--clip_dataset_seed', type=int, default=0, help='Random seed used when shuffling the dataset order.')
+    clip_data.add_argument('--clip_num_workers', type=int, default=0, help='Number of worker processes for CLIP dataloaders.')
+    clip_data.add_argument('--clip_pin_memory', action=argparse.BooleanOptionalAction, default=False, help='Pin dataloader memory for CLIP tasks.')
+    # Default to False to avoid Windows dataloader/pin-memory issues and missing paths
+    clip_data.add_argument('--clip_use_reference_data', action=argparse.BooleanOptionalAction, default=True, help='Use ImageNet1K/Flickr8k reference data for distillation.')
+
+    # ------------------------------------------------------------------
+    # 辅助数据集参�?
     # ------------------------------------------------------------------
     aux = parser.add_argument_group('auxiliary', 'External / auxiliary dataset')
-    aux.add_argument('--auxiliary_data_path', type=str, default='/data1/open_datasets/ImageNet-2012/train/', help='Root path of the auxiliary dataset.')
-    aux.add_argument('--aux_dataset_type', type=str, default='imagenet', help='Dataset type for auxiliary data (e.g. imagenet, cifar).')
-    aux.add_argument('--auxiliary_data_size', type=int, default=2048, help='Number of samples drawn from the auxiliary dataset each epoch.')
+    aux.add_argument('--auxiliary_data_path', type=str, default='D:/projects/datasets/flickr8k', help='Root path of the auxiliary dataset. Example for Flickr8k: D:/projects/datasets/flickr8k')
+    aux.add_argument('--aux_dataset_type', type=str, default='flickr8k', choices=['imagenet', 'flickr8k'], help='Dataset type for auxiliary data (imagenet or flickr8k).')
+    aux.add_argument('--auxiliary_data_size', type=int, default=256, help='Number of samples drawn from the auxiliary dataset each epoch.')
 
     # ------------------------------------------------------------------
     # 正则化 / L2‑Protection
     # ------------------------------------------------------------------
     reg = parser.add_argument_group('regularisation', 'Extra regularisation terms') 
-    reg.add_argument('--l2_protection', action='store_true', default=True, help='Enable L2‑protection between the current and previous network.')
-    reg.add_argument('--l2_protection_lambda', type=float, default=1e-2, help='Weight for the L2‑protection term (higher → stronger regularisation). When `--l2_protection` is off, this will be automatically set to 0.0.')
+    reg.add_argument('--l2_protection', action='store_true', default=False, help='Enable L2‑protection between the current and previous network.')
+    reg.add_argument('--l2_protection_lambda', type=float, default=1.0, help='Weight for the L2‑protection term (higher → stronger regularisation). When `--l2_protection` is off, this will be automatically set to 0.0.')
 
     return parser
 
@@ -155,8 +132,5 @@ def build_parser() -> argparse.ArgumentParser:
 if __name__ == '__main__':
     parser = build_parser()
     args = parser.parse_args()
-
-    args = set_smart_defaults(args)
-
     args = vars(args)
     main(args)

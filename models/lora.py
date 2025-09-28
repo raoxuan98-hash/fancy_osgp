@@ -507,4 +507,8 @@ def build_projection(
         P = V_keep @ V_keep.t()
         I = torch.eye(P.size(0), device=P.device, dtype=P.dtype)
         P = eps * I + (1 - eps) * P
+<<<<<<< HEAD
     return P
+=======
+    return P
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601

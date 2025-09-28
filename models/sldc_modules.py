@@ -11,7 +11,11 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
 from sklearn.cluster import KMeans
+<<<<<<< HEAD
 from torch.utils.data import DataLoader, TensorDataset
+=======
+
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601
 
 # -----------------------------------------------------------------------------
 # Utils
@@ -296,7 +300,11 @@ class Drift_Compensator(object):
             Y = features_after
 
         n_samples, dim = X.size()
+<<<<<<< HEAD
         XTX = X.T @ X + 1e-4 * torch.eye(dim, device=device)
+=======
+        XTX = X.T @ X + self.gamma_1 * torch.eye(dim, device=device)
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601
         XTY = X.T @ Y
         W_global = torch.linalg.solve(XTX, XTY)  # (D, D)
         weight = math.exp(-n_samples / (self.alpha_t * dim))
@@ -310,12 +318,21 @@ class Drift_Compensator(object):
         max_singular = s[0].item()
         min_singular = s[-1].item()
 
+<<<<<<< HEAD
         print( 
             f"仿射变换矩阵（非对称）对角线元素均值：{W_global.diag().mean().item():.4f}，"
             f"融合权重：{weight:.4f}，样本数量：{n_samples}；"
             f"线性修正前差异：{feat_diffs:.4f}；修正后差异：{feat_diffs_pred:.4f}；"
             f"最大奇异值：{max_singular:.2f}；最小奇异值：{min_singular:.2f}")
          
+=======
+        print(
+            f"仿射变换矩阵（非对称）对角线元素均值：{W_global.diag().mean().item():.4f}，"
+            f"融合权重：{weight:.4f}，样本数量：{n_samples}；"
+            f"线性修正前差异：{feat_diffs:.4f}；修正后差异：{feat_diffs_pred:.4f}；"
+            f"最大奇异值：{max_singular:.2f}；最小奇异值：{min_singular:.2f}"
+        )
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601
         return W_global
 
     def _transform_stats_with_W(self, stats_dict: Dict[int, object], W: torch.Tensor) -> Dict[int, object]:
@@ -328,6 +345,7 @@ class Drift_Compensator(object):
         for cid, stat in stats_dict.items():
             if isinstance(stat, MultiMeanGaussianStatistics):
                 means = stat.means @ W           # (K, D)
+<<<<<<< HEAD
                 cov = WT @ stat.cov @ W +        # (D, D)
                 new_stat = MultiMeanGaussianStatistics(means, cov, probs=stat.probs, reg=stat.reg)
             else:  # GaussianStatistics
@@ -453,6 +471,163 @@ class Drift_Compensator(object):
         print(f"[INFO] Built {len(variants)} distribution variants: {list(variants.keys())}")
         return variants
 
+=======
+                cov = WT @ stat.cov @ W + 1e-3 * torch.eye(stat.cov.size(0), device=stat.cov.device)    # (D, D)
+                new_stat = MultiMeanGaussianStatistics(means, cov, probs=stat.probs, reg=stat.reg)
+            else:
+                mean = stat.mean @ W             # (D,)
+                cov = WT @ stat.cov @ W + 1e-3 * torch.eye(stat.cov.size(0), device=stat.cov.device) 
+                new_stat = GaussianStatistics(mean, cov, reg=stat.reg)
+            out[cid] = new_stat
+        return out
+
+    # --------------------- Task-wise 协方差缓存 ---------------------
+    def _get_task_cov_bank(self, features: torch.Tensor):
+        if self._task_cov_cache is not None:
+            return self._task_cov_cache
+        task_cluster_means, task_cluster_covs = self.compute_clusters(
+            features, min_distance=0.5, compute_covariances=True)
+        self._task_cov_cache = (task_cluster_means.to(features.device), task_cluster_covs.to(features.device))
+        return self._task_cov_cache
+
+    def _build_stats(self, features: torch.Tensor, labels: torch.Tensor,
+                    multi_means: bool, use_task_cov: bool) -> Dict[int, object]:
+        device = features.device
+        unique_labels = torch.unique(labels)
+        stats = {}
+
+        if use_task_cov:
+            task_means, task_covs = self._get_task_cov_bank(features)  # (T, D), (T, D, D)
+
+        for lbl in unique_labels:
+            mask = (labels == lbl)
+            class_feats = features[mask]  # (N_c, D)
+
+            if multi_means:
+                kmeans = KMeans(
+                    n_clusters=self.n_clusters_per_class,
+                    n_init=20,
+                    init='k-means++'
+                ).fit(class_feats.cpu().numpy())
+
+                # 取聚类中心并做最小间距约束（不改变簇数量）
+                centers = self._enforce_min_distance(kmeans.cluster_centers_, min_dist=0.1)
+                class_means = torch.from_numpy(centers).to(device=device, dtype=class_feats.dtype)  # (K, D)
+
+                # 每簇样本计数 -> 概率（先验）
+                # 注意：使用 minlength=K，保证形状与中心数一致
+                K = class_means.size(0)
+                counts = torch.bincount(torch.from_numpy(kmeans.labels_), minlength=K).to(device)
+                # 若极端情况下某簇为空（counts.sum()>0 仍成立），做一个极小平滑以避免 0 概率
+                probs = (counts.float() + 1e-12) / (counts.sum().float() + K * 1e-12)
+            else:
+                class_means = class_feats.mean(dim=0, keepdim=True)
+                probs = None  # 单均值情形无需先验权重
+
+            # 2) 协方差
+            if use_task_cov:
+                # 用类均值的平均作为 query 进行注意力加权
+                query = class_means.mean(dim=0, keepdim=True)  # (1, D)
+                sim = query @ task_means.t()
+                # sim = F.normalize(query, dim=1) @ F.normalize(task_means, dim=1).t()  # (1, T)
+                attn = (sim.squeeze(0) / 0.1).softmax(dim=-1)  # (T,)
+                class_cov = sum(attn[i] * task_covs[i] for i in range(task_covs.size(0)))
+            else:
+                # 由该类样本直接估计协方差（必要时可加对角正则）
+                # 若样本数 < 2，torch.cov 会报错或得到 NaN，可在上层保证或这里兜底
+                if class_feats.size(0) >= 2:
+                    class_cov = torch.cov(class_feats.T) 
+                else:
+                    # 兜底：用全局尺度的对角矩阵
+                    d = class_feats.size(1)
+                    class_cov = torch.eye(d, device=device, dtype=class_feats.dtype) * 1e-4
+
+            # 3) 打包
+            cid = int(lbl.item())
+            if multi_means:
+                # print(probs)
+                stats[cid] = MultiMeanGaussianStatistics(class_means, class_cov, probs=probs)
+            else:
+                stats[cid] = GaussianStatistics(class_means, class_cov)  # ctor 会 squeeze 到 (D,)
+        return stats
+
+    # --------------------- 8 种分布一把生成 ---------------------
+    def build_all_variants(self, task_id: int, model_before: nn.Module, model_after: nn.Module, data_loader):
+        """
+        生成并返回 8 份分布：
+          multi_means ∈ {False(单均值), True(多均值-类内共享协方差)}
+          task_cov    ∈ {False(类内协方差), True(task-wise 协方差)}
+          linear      ∈ {False(原空间), True(线性补偿后空间)}
+        命名形如：mm0_tc1_lin0, ...
+        """
+        feats_before, feats_after, labels = self.extract_features_before_after(
+            model_before, model_after, data_loader)
+
+        # 初始化缓存噪声
+        if self.cached_Z is None:
+            self.cached_Z = torch.randn(50000, feats_after.size(1))
+
+        # 线性补偿矩阵
+        if self.compensate and task_id > 0:
+            aux_loader = self.get_aux_loader(self.args)
+            feats_aux_before, feats_aux_after = self.extract_features_before_after_for_auxiliary_data(
+                model_before, model_after, aux_loader)
+            feats_b = torch.cat([feats_before, feats_aux_before], dim=0)
+            feats_a = torch.cat([feats_after, feats_aux_after], dim=0)
+            W = self.compute_linear_transform(feats_b, feats_a)
+
+            if hasattr(self, "linear_transforms"):
+                self.linear_transforms[task_id] = W.cpu()
+            else:
+                self.linear_transforms = {}
+                self.linear_transforms[task_id] = W.cpu()
+
+        # 刷新 task-wise 协方差缓存
+        self._task_cov_cache = None
+        self._get_task_cov_bank(feats_after)
+
+        # 组合开关
+        configs = []
+        for multi_means in (False, True):
+            for use_task_cov in (False, True):
+                configs.append((multi_means, use_task_cov))
+
+        variants = {}
+        for m, t in configs:
+            key = f"multi-mean:{m}_task-shared-cov:{t}"
+
+            stats = self._build_stats(
+                features=feats_after, labels=labels,
+                multi_means=m, use_task_cov=t)
+            
+            variants[key] = stats
+
+        if hasattr(self, "variants") and len(self.variants) > 0:
+            if self.compensate and task_id > 0:
+                for key, stats in self.variants.items():
+                   if "compensate" in key:
+                       self.variants[key] = self._transform_stats_with_W(stats, W)
+                       
+            for key, stats in variants.items():
+                self.variants[key].update(variants[key])
+                if self.compensate and task_id > 0:
+                    new_key = f"{key}_compensate"
+                    self.variants[new_key].update(variants[key])
+        
+        else:
+            self.variants = variants
+            if self.compensate:
+                compensated_variants = {}
+                for key, stats in variants.items():
+                    new_key = f"{key}_compensate"
+                    compensated_variants[new_key] = copy.deepcopy(stats)
+                self.variants.update(compensated_variants)
+
+        print(f"[INFO] Built {len(variants)} distribution variants: {list(variants.keys())}")
+        return variants
+
+
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601
     # --------------------- 分类器再训练（采样驱动） ---------------------
     def train_classifier_with_cached_samples(self, fc: nn.Module, stats: Dict[int, object],
                                              epochs: int = 6, use_weighted_cov: bool = False) -> nn.Module:
@@ -562,8 +737,12 @@ class Drift_Compensator(object):
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
+<<<<<<< HEAD
                                  std=[0.229, 0.224, 0.225])
         ])
+=======
+                                 std=[0.229, 0.224, 0.225])])
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601
 
         if aux_dataset_type == 'imagenet':
             if 'auxiliary_data_path' not in args:
@@ -583,6 +762,7 @@ class Drift_Compensator(object):
 
         self.aux_loader = DataLoader(train_subset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
         return self.aux_loader
+<<<<<<< HEAD
 
 
 # -----------------------------------------------------------------------------
@@ -602,3 +782,5 @@ class Drift_Compensator(object):
 # variants = dc.build_all_variants(task_id, model_before, model_after, data_loader)
 # # 训练分类器
 # classifiers = dc.refine_classifiers_from_variants(fc, epochs=6, use_weighted_cov=False)
+=======
+>>>>>>> 4816499fc2b904e2d81571b705b8f392a7bd6601

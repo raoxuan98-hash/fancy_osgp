@@ -4,14 +4,15 @@ from torch import nn
 from copy import deepcopy
 import timm
 from lora import NullSpaceViT
-from proj_lora import LoRAViT
 from models.basic_lora import PlainLoRAViT
-from models.osgp_lora import OSGPLoRAViT, SGPLoRAViT
-from models.osgp_lora_clip import OSGPLoRAViT_CLIP, SGPLoRAViT_CLIP
-# from models.sgp_lora import SGPLoRAViT
+from models.sgp_lora import SGPLoRAViT, SGPLoRACLIPVisionTransformer
+from transformers import CLIPModel, CLIPProcessor
+from torchvision import transforms
+import os
 
-rank = 2
-subspace_dim = 12
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 def get_vit(args, pretrained=False):
     name = args['vit_type']
     name = name.lower()
@@ -35,7 +36,6 @@ def get_vit(args, pretrained=False):
         raise ValueError(f'Model {name} not supported')
     
     vit.head = nn.Identity()
-    
     del vit.norm
     vit.norm = nn.LayerNorm(768, elementwise_affine=False)
     
@@ -46,43 +46,56 @@ def get_vit(args, pretrained=False):
     elif lora_type == "basic_lora":
         return PlainLoRAViT(vit, r=rank)
 
-    elif lora_type == "osgp_lora":
-        return OSGPLoRAViT(vit, r=rank, proj_temp=args['proj_temp'], kl_gamma=args['kl_gamma'], trace_k=args['trace_k'], weight_p=args['weight_p'])
-    
     elif lora_type == "sgp_lora":
-        return SGPLoRAViT(vit, r=rank,proj_temp=args['proj_temp'], use_soft_projection=True, k=args['trace_k'], weight_kind=args['weight_kind'], weight_p=args['weight_p'])
+        return SGPLoRAViT(vit, r=rank, weight_temp=args['weight_temp'], use_soft_projection=True, weight_kind=args['weight_kind'], weight_p=args['weight_p'])
     
     elif lora_type == "nsp_lora":
-        return SGPLoRAViT(vit, r=rank,proj_temp=args['proj_temp'], use_soft_projection=False, k=args['trace_k'], nsp_eps=args['nsp_eps'], nsp_weight=args['nsp_weight'])
+        return SGPLoRAViT(vit, r=rank, weight_temp=args['weight_temp'], use_soft_projection=False, nsp_eps=args['nsp_eps'], nsp_weight=args['nsp_weight'])
+
+    else:
+        raise ValueError(f"LoRA type {lora_type} not supported")
 
 
-def get_clip_model(args):
-    rank = args['lora_rank']
+def get_clip_model(args, train_mode="lora"):
+    """
+    train_mode: "lora" | "full" | "frozen"
+    """
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
 
-    import clip 
-    model, train_preprocess, val_preprocess = clip.load("ViT-B/16", jit=False)
+    if train_mode == "frozen":
+        for p in model.parameters():
+            p.requires_grad = False
+        # 不加 LoRA，完全冻结
+        return model, processor
 
-    for parameter in model.visual.parameters():
-        parameter.requires_grad = False
-    
-    for parameter in model.transformer.parameters():
-        parameter.requires_grad = False
-    
-    lora_type = args['lora_type']
+    elif train_mode == "full":
+        for n, p in model.named_parameters():
+            if "vision_model.encoder.layers" in n and ("self_attn" in n or "mlp" in n):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+        return model, processor
 
-    if lora_type == "full":
-        model = NullSpaceViT(model.visual, use_projection=args['use_projection'])
+    elif train_mode == "lora":
+        for p in model.parameters():
+            p.requires_grad = False
 
-    elif lora_type == "osgp_lora":
-        model = OSGPLoRAViT_CLIP(model, r=rank, proj_temp=args['proj_temp'], kl_gamma=args['kl_gamma'], trace_k=args['trace_k'], weight_p=args['weight_p'])
-    
-    elif lora_type == "sgp_lora":
-        model = SGPLoRAViT_CLIP(model, r=rank, proj_temp=args['proj_temp'], use_soft_projection=True, k=args['trace_k'], weight_kind=args['weight_kind'], weight_p=args['weight_p'])
-    
-    elif lora_type == "nsp_lora":
-        model = SGPLoRAViT_CLIP(model, r=rank, proj_temp=args['proj_temp'], use_soft_projection=False, k=args['trace_k'], nsp_eps=args['nsp_eps'], nsp_weight=args['nsp_weight'])
+        rank = args['lora_rank']
 
-    return model, train_preprocess, val_preprocess
+        model.vision_model = SGPLoRACLIPVisionTransformer(
+            model.vision_model,
+            r=rank,
+            weight_temp=args['weight_temp'],
+            use_soft_projection=True,
+            weight_kind=args['weight_kind'],
+            weight_p=args['weight_p'])
+        
+        return model, processor
+
+    else:
+        raise ValueError(f"Unsupported train_mode: {train_mode}")
+
 
 class ContinualLinear(nn.Module):
     def __init__(self, embed_dim, nb_classes):
@@ -94,10 +107,9 @@ class ContinualLinear(nn.Module):
 
     def update(self, nb_classes):
         new_head = nn.Linear(self.embed_dim, nb_classes, bias=False)
-        
         self.heads.append(new_head)
-        
         new_head_weights = nn.Parameter(torch.ones(self.current_output_size + nb_classes))
+
         with torch.no_grad():
             new_head_weights[:self.current_output_size] = self.head_weights
             new_head_weights[self.current_output_size:] = 1.0
@@ -137,25 +149,38 @@ class BaseNet(nn.Module):
 
     def copy(self):
         return copy.deepcopy(self)
-    
+
 
 class CLIP_BaseNet(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, train_mode="full"):
         super(CLIP_BaseNet, self).__init__()
-        self.model, self.train_preprocess, self.valid_preprocess = get_clip_model(args)
-        self.fc = None
+        self.train_mode = train_mode
+
+        self.model, self.processor = get_clip_model(args, train_mode=train_mode)
+
+        self.valid_preprocess = transforms.Compose([
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711])])
 
     def forward(self, img, text):
-        x = self.model.clip.encode_image(img)
-        y = self.model.clip.encode_text(text)
+        x = self.model.get_image_features(img)
+        y = self.model.get_text_features(text)
         return x, y
-    
+
     def encode_image(self, img):
-        return self.model.clip.encode_image(img)
-    
+        return self.model.get_image_features(img)
+
     def encode_text(self, text):
-        return self.model.clip.encode_text(text)
-    
+        text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
+        text_inputs = {k: v.to(self.model.device) for k, v in text_inputs.items()}
+        text_features = self.model.get_text_features(**text_inputs)
+        return text_features
+
     @property
     def feature_dim(self):
-        return self.model.embed_dim
+        return self.model.config.projection_dim  # CLIP 输出维度，通常是 512
