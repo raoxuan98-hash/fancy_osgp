@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument('--lora_rank', type=int, default=8, help='LoRA rank.')
     model.add_argument('--lora_type', type=str, default="sgp_lora", choices=['basic_lora', 'osgp_lora', 'sgp_lora', 'nsp_lora', 'full'], help='Type of LoRA adaptor.')
     model.add_argument('--weight_temp', type=float, default=4, help='Projection temperature.')
+    model.add_argument('--sgp_soft_projection', action=argparse.BooleanOptionalAction, default=True, help='Toggle soft projection when using SGP-based adapters.')
 
     # NSP相关的参数
     model.add_argument('--nsp_eps', type=float, default=0.05, choices=[0.05, 0.10])

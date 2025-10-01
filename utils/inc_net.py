@@ -83,11 +83,13 @@ def get_clip_model(args, train_mode="lora"):
 
         rank = args['lora_rank']
 
+        use_soft_projection = bool(args.get('sgp_soft_projection', True))
+
         model.vision_model = SGPLoRACLIPVisionTransformer(
             model.vision_model,
             r=rank,
             weight_temp=args['weight_temp'],
-            use_soft_projection=True,
+            use_soft_projection=use_soft_projection,
             weight_kind=args['weight_kind'],
             weight_p=args['weight_p'])
         
