@@ -1,9 +1,12 @@
 import os
 import sys
+import math
 import logging
 import torch
 import random
 import numpy as np
+from collections.abc import Mapping, Sequence
+from typing import Any
 from models.subspace_lora_clip import SubspaceLoRA_CLIP
 from utils.toolkit import count_parameters
 
@@ -57,18 +60,35 @@ def train_single_run(args):
     logging.info(f'All params: {count_parameters(model.network)}')
     logging.info(f'Trainable params: {count_parameters(model.network, True)}')
     final_results = model.loop()
-    # Ensure a dict is returned for aggregation
-    if isinstance(final_results, dict):
-        return final_results
-    # Fallback: package minimal results from model history if available
-    try:
-        hist = getattr(model, 'history', {})
-        return {
-            'average_accuracies': {'zeroshot': float(hist.get('zeroshot_acc', [-1])[-1]) if hist.get('zeroshot_acc') else None},
-            'last_task_accuracies': {'zeroshot': float(hist.get('zeroshot_acc', [-1])[-1]) if hist.get('zeroshot_acc') else None},
-        }
-    except Exception:
-        return {'average_accuracies': {}, 'last_task_accuracies': {}}
+
+    history: dict[str, Any]
+    if isinstance(final_results, Mapping):
+        history = {k: v for k, v in final_results.items()}
+    else:
+        # Fallback to the model history attribute when loop() did not
+        # return a dictionary (older checkpoints, debugging paths, ...).
+        history = {}
+        maybe_hist = getattr(model, 'history', None)
+        if isinstance(maybe_hist, Mapping):
+            history = {k: v for k, v in maybe_hist.items()}
+
+    zeroshot_values = history.get('zeroshot_acc') if history else None
+    final_zeroshot = math.nan
+    if isinstance(zeroshot_values, Sequence) and len(zeroshot_values) > 0:
+        try:
+            final_zeroshot = float(zeroshot_values[-1])
+        except (TypeError, ValueError):
+            logging.debug('Could not coerce zeroshot history %r to float', zeroshot_values[-1])
+
+    packaged_results = {
+        'average_accuracies': {'zeroshot': final_zeroshot},
+        'last_task_accuracies': {'zeroshot': final_zeroshot},
+    }
+
+    if history:
+        packaged_results['history'] = history
+
+    return packaged_results
 
 def set_device(device_type):
     """Properly set the device (either CPU or GPU) based on input.
