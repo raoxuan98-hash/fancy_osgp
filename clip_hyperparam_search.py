@@ -27,7 +27,6 @@ from trainer_clip import train
 @dataclass
 class TrialMetrics:
     """Summary statistics computed from raw per-seed metrics."""
-
     mean: float
     std: float
     minimum: float
@@ -295,8 +294,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--n-trials",
         type=int,
-        default=None,
-        help="Number of Optuna trials to run. Defaults to exhaustive enumeration of the discrete space.",
+        default=10,
+        help="Total number of Optuna trials to run (including previously completed ones).",
     )
     parser.add_argument(
         "--timeout",
@@ -317,18 +316,25 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default="maximize",
         help="Optimisation direction passed to Optuna.",
     )
+
     parser.add_argument(
         "--study-name",
         type=str,
-        default=None,
-        help="Optional Optuna study name (useful when reusing a storage backend).",
+        default="clip-optuna-optimization",
+        help="Optuna study name (must be consistent across runs for resumption).",
     )
+
     parser.add_argument(
         "--storage",
         type=str,
         default=None,
-        help="Optuna storage URL (e.g. sqlite:///study.db). If omitted, in-memory storage is used.",
+        help=(
+            "Optuna storage URL (e.g., 'sqlite:///study.db'). "
+            "If not provided, a default SQLite file '<study-name>.db' is used. "
+            "In-memory storage is NOT supported for resumption."
+        ),
     )
+
     parser.add_argument(
         "--sampler",
         type=str,
@@ -336,6 +342,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default="tpe",
         help="Sampler to use for navigating the discrete search space.",
     )
+    
     parser.add_argument(
         "--log-level",
         type=str,
@@ -354,6 +361,9 @@ def _build_sampler(name: str) -> optuna.samplers.BaseSampler:
 
 
 def main() -> None:
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = "2"
+
     cli_parser = _build_cli_parser()
     cli_args = cli_parser.parse_args()
 
@@ -362,6 +372,7 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
+    # Prepare base arguments
     overrides: Dict[str, Any] = {}
     device_override = _coerce_device(cli_args.device)
     if device_override is not None:
@@ -373,16 +384,27 @@ def main() -> None:
     base_args = _prepare_base_arguments(overrides)
     search_space = _default_search_space()
 
-    sampler = _build_sampler(cli_args.sampler)
+    # Resolve storage URL: always use file-based for resumption
+    if cli_args.storage:
+        storage_url = cli_args.storage
+    else:
+        default_db = Path(f"{cli_args.study_name}.db").resolve()
+        storage_url = f"sqlite:///{default_db}"
+        logging.info("No --storage specified. Using default SQLite file at %s", default_db)
 
+    # Create or load study
+    sampler = _build_sampler(cli_args.sampler)
     study = optuna.create_study(
         study_name=cli_args.study_name,
-        storage=cli_args.storage,
+        storage=storage_url,
         direction=cli_args.direction,
         sampler=sampler,
-        load_if_exists=bool(cli_args.study_name and cli_args.storage),
+        load_if_exists=True,
     )
 
+    logging.info("Loaded %d existing trials from storage.", len(study.trials))
+
+    # Run optimization
     study.optimize(
         lambda trial: _objective(
             trial,
@@ -394,13 +416,14 @@ def main() -> None:
         timeout=cli_args.timeout,
     )
 
+    # Save results
     results = _compile_results(study)
-
     output_path = cli_args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fp:
         json.dump([result.to_json() for result in results], fp, indent=2)
 
+    # Log best result
     if study.trials:
         best_trial = study.best_trial
         logging.info(
@@ -414,4 +437,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

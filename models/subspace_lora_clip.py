@@ -712,10 +712,13 @@ class SubspaceLoRAClipLearner(BaseLearner):
                 logits_modified[row_indices, local_targets] += 1.0
 
                 ce_loss = F.cross_entropy(logits_modified, local_targets, label_smoothing=0.1)
+                
                 kd_term, kd_metrics = self._compute_reference_regularisation(
-                    reference_img_feats,
+                    reference_images,          # 原始图像 -> 教师网络
+                    reference_img_feats,       # 学生特征（已由本轮前向得到）
                     reference_batch.labels,
                 )
+
                 l2_term = self.l2_protection_loss()
                 prior_term = (
                     self.network.model.vision_model.regularization_loss()
@@ -806,10 +809,10 @@ class SubspaceLoRAClipLearner(BaseLearner):
 
     def _compute_reference_regularisation(
         self,
-        reference_img_feats: Optional[torch.Tensor],
+        reference_images: Optional[torch.Tensor],
+        student_ref_feats: Optional[torch.Tensor],
         reference_labels: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute KD-based regularisation terms when reference data is provided."""
 
         zero = torch.tensor(0.0, device=self.device)
         metrics = {
@@ -822,53 +825,67 @@ class SubspaceLoRAClipLearner(BaseLearner):
             "student_ref_probs_max": 0.0,
         }
 
+        # 条件检查
         if (
             not self.use_feature_kd
-            or reference_img_feats is None
+            or reference_images is None
+            or student_ref_feats is None
             or self.reference_text_embeddings is None
             or self.reference_text_labels is None
             or reference_labels is None
         ):
             return zero, metrics
 
+        # 1) 教师特征：图像 -> 教师网络
         with torch.no_grad():
-            reference_inputs_prev = reference_img_feats
-            if self.prev_network is not None:
-                prev_feats = self.prev_network.encode_image(reference_img_feats)
-                reference_inputs_prev = prev_feats / prev_feats.norm(dim=-1, keepdim=True)
+            with autocast(**self._autocast_kwargs):
+                teacher_feats = self.prev_network.encode_image(reference_images.to(self.device, non_blocking=True))
+            teacher_feats = teacher_feats / teacher_feats.norm(dim=-1, keepdim=True)
 
-            if isinstance(reference_labels, torch.Tensor):
-                ref_labels_tensor = reference_labels.to(dtype=torch.long, device="cpu")
-            elif isinstance(reference_labels, (list, tuple)):
-                ref_labels_tensor = torch.tensor(reference_labels, dtype=torch.long)
-            else:
-                ref_labels_tensor = torch.tensor([int(reference_labels)], dtype=torch.long)
+        # 2) 学生特征已在外部算好，标准化保障可比性
+        student_feats = student_ref_feats
+        if student_feats is None:
+            return zero, metrics
+        # student_feats 在调用处已标准化，这里作为保险再做一次
+        student_feats = student_feats / student_feats.norm(dim=-1, keepdim=True)
 
-            if (
-                ref_labels_tensor.numel() == 0
-                or ref_labels_tensor.min().item() < 0
-                or ref_labels_tensor.max().item() >= self._n_reference_text
-            ):
-                return zero, metrics
+        # 3) 取与每张 reference 图像对应的文本特征
+        if isinstance(reference_labels, torch.Tensor):
+            ref_labels_tensor = reference_labels.to(dtype=torch.long, device="cpu")
+        elif isinstance(reference_labels, (list, tuple)):
+            ref_labels_tensor = torch.tensor(reference_labels, dtype=torch.long)
+        else:
+            ref_labels_tensor = torch.tensor([int(reference_labels)], dtype=torch.long)
 
-            ref_indices = self.reference_text_labels[ref_labels_tensor]
-            reference_text_feats = self.reference_text_embeddings[ref_indices].to(self.device)
+        if (
+            ref_labels_tensor.numel() == 0
+            or ref_labels_tensor.min().item() < 0
+            or ref_labels_tensor.max().item() >= self._n_reference_text
+        ):
+            return zero, metrics
 
+        ref_indices = self.reference_text_labels[ref_labels_tensor]
+        reference_text_feats = self.reference_text_embeddings[ref_indices].to(self.device)
+
+        # 4) 蒸馏项计算
         logit_scale = self.network.model.logit_scale
-        ref_feature_l2_dist = F.mse_loss(reference_img_feats, reference_inputs_prev)
-        ref_feature_cosine_sim = F.cosine_similarity(reference_img_feats, reference_inputs_prev).mean()
+        # a) 特征对齐（L2 + 余弦）
+        ref_feature_l2_dist = F.mse_loss(student_feats, teacher_feats)
+        ref_feature_cosine_sim = F.cosine_similarity(student_feats, teacher_feats).mean()
 
-        teacher_logits_ref = logit_scale.exp() * (reference_inputs_prev @ reference_text_feats.T)
-        student_logits_ref = logit_scale.exp() * (reference_img_feats @ reference_text_feats.T)
+        # b) 通过与文本的对齐分布做 KL 蒸馏（teacher logits / student logits）
+        teacher_logits_ref = logit_scale.exp() * (teacher_feats @ reference_text_feats.T)
+        student_logits_ref = logit_scale.exp() * (student_feats @ reference_text_feats.T)
 
         prob_teacher_ref = F.softmax(teacher_logits_ref, dim=-1)
         prob_student_ref = F.softmax(student_logits_ref, dim=-1)
 
-        temperature = 5.0
+        temperature = 2.0
         teacher_probs = F.softmax(teacher_logits_ref / temperature, dim=-1).detach()
         student_log_probs = F.log_softmax(student_logits_ref / temperature, dim=-1)
         ref_raw_kl = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature * temperature)
 
+        # 总 KD 项（保持你原先的加权）
         kd_term = ref_feature_l2_dist + 2.0 * ref_raw_kl
 
         metrics.update(
@@ -881,6 +898,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
             student_ref_probs_max=float(prob_student_ref.max().item()),
         )
         return kd_term, metrics
+
 
     def _update_metric_smoothers(
         self,
@@ -956,7 +974,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
         if self.use_reference_data:
             if self.reference_loader is not None:
                 self.train_loader_test_mode = self.reference_loader
-            self.update_projection_matrices(initial_weight=1.0)
+            self.update_projection_matrices(initial_weight=2.0)
 
         for task_idx, dataset_name in enumerate(self.dataset_names):
             task_meta = self.clip_manager.get_task_metadata(task_idx)
@@ -968,7 +986,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
                 task_meta["train_size"],
                 task_meta["test_size"],
                 task_meta["num_classes"],
-            )
+)
 
             class_names = self.clip_manager.get_task_class_names(task_idx, cumulative=False)
             templates = self._resolve_templates(self.clip_manager.get_dataset_templates(task_idx))
@@ -996,7 +1014,8 @@ class SubspaceLoRAClipLearner(BaseLearner):
 
             logging.info("Evaluating zeroshot performance after task %d", task_idx + 1)
             zeroshot_results = {}
-            for eval_idx in range(task_idx + 1):
+            # for eval_idx in range(task_idx + 1):
+            for eval_idx in range(len(self.dataset_names)):
                 accuracy = self.evaluate_zeroshot(eval_idx)
                 eval_name = self.dataset_names[eval_idx]
                 zeroshot_results[eval_name] = accuracy
@@ -1005,8 +1024,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
             avg_zeroshot = (
                 sum(zeroshot_results.values()) / len(zeroshot_results)
                 if zeroshot_results
-                else 0.0
-            )
+                else 0.0)
 
             self.history["zeroshot_acc"].append(avg_zeroshot)
             logging.info("Average zeroshot accuracy after task %d: %.2f%%", task_idx + 1, avg_zeroshot)

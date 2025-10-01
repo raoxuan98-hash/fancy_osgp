@@ -6,14 +6,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import datasets
 
-ROOT = "D:/projects/datasets/elevater"
-
+ROOT = "/data1/open_datasets/chinese-clip-eval/elevater"
 
 def pil_loader(path: str) -> Image.Image:
     with open(path, "rb") as f:
         img = Image.open(f)
         return img.convert("RGB")
-
 
 def underline_to_space(s: str) -> str:
     return s.replace("_", " ")
@@ -70,6 +68,8 @@ class SimpleDataset(Dataset):
         return image, label, class_name
 
 
+import numpy as np
+
 class BaseData:
     """只负责提供原始数据，不做 transform"""
     def __init__(self, dataset_name: Optional[str] = None) -> None:
@@ -83,6 +83,11 @@ class BaseData:
         self.test_targets: Optional[np.ndarray] = None
         self.templates: Optional[List[Callable]] = None
 
+        # 控制参数
+        self.limit_test_samples: bool = False
+        self.max_test_samples: Optional[int] = 2048
+        self.shuffle_test_samples: bool = True  # 是否随机抽样
+
     def download_data(self) -> None:
         raise NotImplementedError
 
@@ -91,10 +96,24 @@ class BaseData:
             self.class_names = [underline_to_space(x) for x in self.class_names]
 
     def build_dataset(self, train=True, transform=None):
-        """返回一个 SimpleDataset"""
-        data = self.train_data if train else self.test_data
-        labels = self.train_targets if train else self.test_targets
-        return SimpleDataset(data, labels, use_path=self.use_path,
+        """返回一个 SimpleDataset，可选限制+随机测试集样本数"""
+        if train:
+            data = self.train_data
+            labels = self.train_targets
+        else:
+            data = self.test_data
+            labels = self.test_targets
+            if self.limit_test_samples and self.max_test_samples is not None:
+                n = len(data)
+                if self.shuffle_test_samples:
+                    idx = np.random.permutation(n)[:self.max_test_samples]
+                else:
+                    idx = np.arange(self.max_test_samples)
+                data = data[idx]
+                labels = labels[idx]
+
+        return SimpleDataset(data, labels,
+                             use_path=self.use_path,
                              class_names=self.class_names,
                              templates=self.templates,
                              transform=transform)
