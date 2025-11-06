@@ -1,5 +1,4 @@
-﻿
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import math
@@ -260,9 +259,8 @@ class SubspaceLoRAClipLearner(BaseLearner):
             dataset_type=str(args.get("aux_dataset_type", "imagenet")).lower(),
             dataset_path=args.get("auxiliary_data_path"),
             batch_size=int(args.get("reference_batch_size", args["batch_size"])),
-            num_workers=int(args.get("clip_num_workers", 0)),
-            pin_memory=bool(args.get("clip_pin_memory", True)),
-        )
+            num_workers=int(args.get("clip_num_workers", 3)),
+            pin_memory=bool(args.get("clip_pin_memory", True)))
         return optim_cfg, loop_cfg, reg_cfg, reference_cfg
 
     @staticmethod
@@ -466,19 +464,12 @@ class SubspaceLoRAClipLearner(BaseLearner):
         """Entry-point for training on a new task with optional weight interpolation."""
 
         start_time = time.time()
-        # Before starting a new task, fuse current LoRA into backbone
-        # and re-initialise LoRA parameters for the next task.
-        # try:
-        #     vm = getattr(self.network.model, "vision_model", None)
-        #     if vm is not None and hasattr(vm, "merge_lora_weights"):
-        #         vm.merge_lora_weights()
-        #         if hasattr(vm, "reset_parameters_svd"):
-        #             vm.reset_parameters_svd()
-        # except Exception as exc:
-        #     logging.warning("LoRA merge/reinit before new task failed: %s", exc)
+        vm = getattr(self.network.model, "vision_model", None)
+        if vm is not None and hasattr(vm, "merge_lora_weights"):
+            vm.merge_lora_weights()
+            vm.reset_parameters_standard()
 
         self._cur_task += 1
-
         self._current_global_to_local, self._current_num_classes = self._get_task_label_mapping(self._cur_task)
 
         self.store_prev_params()
@@ -508,21 +499,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
             optimizer = optim.RMSprop(params, lr=self.lrate, weight_decay=self.weight_decay)
         else:
             raise ValueError(f"Unsupported optimizer: {self.optimizer_type}")
-
-        if self.warmup_steps > 0:
-            eta_min = self.eta_min
-
-            def lr_lambda(step: int) -> float:
-                if step < self.warmup_steps:
-                    return step / max(1, self.warmup_steps)
-                progress = (step - self.warmup_steps) / max(1, self.iterations - self.warmup_steps)
-                lr_ratio = eta_min / self.lrate
-                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-                return lr_ratio + cosine_decay * (1.0 - lr_ratio)
-
-            scheduler: _LRScheduler = LambdaLR(optimizer, lr_lambda)
-        else:
-            scheduler = CosineAnnealingLR(optimizer, T_max=self.iterations, eta_min=self.eta_min)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.iterations, eta_min=self.lrate / 2)
 
         return optimizer, scheduler
 
@@ -707,18 +684,17 @@ class SubspaceLoRAClipLearner(BaseLearner):
                 loss = combined_img_feats.new_zeros((), dtype=combined_img_feats.dtype, device=combined_img_feats.device)
             else:
                 logits_modified = logits_per_image.clone()
-                batch_size = logits_modified.size(0)
-                row_indices = torch.arange(batch_size, device=logits_modified.device)
-                logits_modified[row_indices, local_targets] += 1.0
+                # batch_size = logits_modified.size(0)
+                # row_indices = torch.arange(batch_size, device=logits_modified.device)
+                # logits_modified[row_indices, local_targets] += 1.0
 
                 ce_loss = F.cross_entropy(logits_modified, local_targets, label_smoothing=0.1)
-                
+
                 kd_term, kd_metrics = self._compute_reference_regularisation(
                     reference_images,          # 原始图像 -> 教师网络
                     reference_img_feats,       # 学生特征（已由本轮前向得到）
                     reference_batch.labels,
                 )
-
                 l2_term = self.l2_protection_loss()
                 prior_term = (
                     self.network.model.vision_model.regularization_loss()
@@ -899,7 +875,6 @@ class SubspaceLoRAClipLearner(BaseLearner):
         )
         return kd_term, metrics
 
-
     def _update_metric_smoothers(
         self,
         similarity_per_image: torch.Tensor,
@@ -974,7 +949,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
         if self.use_reference_data:
             if self.reference_loader is not None:
                 self.train_loader_test_mode = self.reference_loader
-            self.update_projection_matrices(initial_weight=2.0)
+            self.update_projection_matrices(initial_weight=1.0)
 
         for task_idx, dataset_name in enumerate(self.dataset_names):
             task_meta = self.clip_manager.get_task_metadata(task_idx)
@@ -986,7 +961,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
                 task_meta["train_size"],
                 task_meta["test_size"],
                 task_meta["num_classes"],
-)
+            )
 
             class_names = self.clip_manager.get_task_class_names(task_idx, cumulative=False)
             templates = self._resolve_templates(self.clip_manager.get_dataset_templates(task_idx))
@@ -1014,8 +989,9 @@ class SubspaceLoRAClipLearner(BaseLearner):
 
             logging.info("Evaluating zeroshot performance after task %d", task_idx + 1)
             zeroshot_results = {}
-            # for eval_idx in range(task_idx + 1):
+
             for eval_idx in range(len(self.dataset_names)):
+            # for eval_idx in range(task_idx + 1):
                 accuracy = self.evaluate_zeroshot(eval_idx)
                 eval_name = self.dataset_names[eval_idx]
                 zeroshot_results[eval_name] = accuracy
@@ -1024,7 +1000,8 @@ class SubspaceLoRAClipLearner(BaseLearner):
             avg_zeroshot = (
                 sum(zeroshot_results.values()) / len(zeroshot_results)
                 if zeroshot_results
-                else 0.0)
+                else 0.0
+            )
 
             self.history["zeroshot_acc"].append(avg_zeroshot)
             logging.info("Average zeroshot accuracy after task %d: %.2f%%", task_idx + 1, avg_zeroshot)

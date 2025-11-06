@@ -66,7 +66,6 @@ def get_clip_model(args, train_mode="lora"):
     if train_mode == "frozen":
         for p in model.parameters():
             p.requires_grad = False
-        # 不加 LoRA，完全冻结
         return model, processor
 
     elif train_mode == "full":
@@ -83,7 +82,10 @@ def get_clip_model(args, train_mode="lora"):
 
         rank = args['lora_rank']
 
-        use_soft_projection = bool(args.get('sgp_soft_projection', True))
+        if args['lora_type'] == 'nsp_lora':
+            use_soft_projection = False
+        elif args['lora_type'] == "sgp_lora":
+            use_soft_projection = True
 
         model.vision_model = SGPLoRACLIPVisionTransformer(
             model.vision_model,
@@ -91,7 +93,9 @@ def get_clip_model(args, train_mode="lora"):
             weight_temp=args['weight_temp'],
             use_soft_projection=use_soft_projection,
             weight_kind=args['weight_kind'],
-            weight_p=args['weight_p'])
+            weight_p=args['weight_p'],
+            nsp_eps=args['nsp_eps'],
+            nsp_weight=args['nsp_weight'])
         
         return model, processor
 
