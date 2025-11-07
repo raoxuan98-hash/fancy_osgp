@@ -75,6 +75,7 @@ class SGPBaseLoRA(nn.Module):
             delta = self.B @ self.A @ P_scaled
             # 确保设备一致性
             self.linear.weight.data.add_(delta)
+            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
             self.B.data.zero_()
             self.lora_active.copy_(torch.tensor(lora_active, device=self.lora_active.device))
 
@@ -126,6 +127,7 @@ class SGPBaseDoRA(nn.Module):
             P_scaled = self.P()
             lora_delta = self.B @ self.A @ P_scaled
             self.weight_directions.data.add_(lora_delta)
+            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
             self.B.data.zero_()
             self.lora_active = torch.tensor(lora_active)
 

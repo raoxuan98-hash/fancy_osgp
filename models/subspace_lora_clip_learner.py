@@ -144,6 +144,8 @@ class SubspaceLoRAClipLearner(BaseLearner):
         logging.info(f"参考数据配置 - enabled: {self.use_reference_data}")
         logging.info(f"知识蒸馏配置 - gamma_kd: {self.gamma_kd}")
         logging.info(f"特征知识蒸馏启用状态 - use_feature_kd: {self.use_feature_kd}")
+        logging.info(f"Layer-wise蒸馏配置 - layerwise_kd_enabled: {self.reg_cfg.layerwise_kd_enabled}")
+        logging.info(f"Layer-wise蒸馏权重 - layerwise_kd_weight: {self.reg_cfg.layerwise_kd_weight}")
 
         # Timing and history
         self._timings: Timing = Timing()
@@ -154,6 +156,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
             "ema_acc": [],
             "lr": [],
             "zeroshot_acc": [],
+            "layerwise_kd_loss": [],  # 添加layerwise蒸馏损失的历史记录
         }
 
         # Set timings reference for training manager
@@ -187,7 +190,7 @@ class SubspaceLoRAClipLearner(BaseLearner):
             l2_enabled=bool(args.get("l2_protection", False)),
             l2_lambda=float(args.get("l2_protection_lambda", 0.0)),
             bidirectional_kd=bool(args.get("bidirectional_kd", False)),
-            layerwise_kd_enabled=bool(args.get("layerwise_kd_enabled", False)),
+            layerwise_kd_enabled=bool(args.get("layerwise_kd_enabled", True)),
             layerwise_kd_weight=float(args.get("layerwise_kd_weight", 1.0)),
             layerwise_kd_layers=None,  # 可以从args中获取，目前使用None表示所有层
             layerwise_kd_pooling=str(args.get("layerwise_kd_pooling", "mean")),

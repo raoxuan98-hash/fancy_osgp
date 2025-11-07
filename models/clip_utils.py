@@ -138,6 +138,7 @@ def build_metric_smoothers(alpha: float) -> Dict[str, EMASmooth]:
         "ref_feature_l2": EMASmooth(alpha=alpha),
         "ref_feature_cosine": EMASmooth(alpha=alpha),
         "ref_raw_kl": EMASmooth(alpha=alpha),
+        "layerwise_kd_loss": EMASmooth(alpha=alpha),  # 添加layerwise蒸馏损失的监控
         "teacher_ref_probs_min": EMASmooth(alpha=alpha),
         "teacher_ref_probs_max": EMASmooth(alpha=alpha),
         "student_ref_probs_min": EMASmooth(alpha=alpha),

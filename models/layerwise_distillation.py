@@ -86,32 +86,75 @@ class LayerwiseFeatureCollector:
         encoder_layers = None
         
         # 尝试不同的路径找到编码器层
-        if hasattr(self.model, 'clip_vision_model'):
-            vision_model = getattr(self.model, 'clip_vision_model', None)
-            if vision_model is not None and hasattr(vision_model, 'encoder'):
-                encoder = getattr(vision_model, 'encoder', None)
-                if encoder is not None and hasattr(encoder, 'layers'):
-                    encoder_layers = getattr(encoder, 'layers', None)
-        elif hasattr(self.model, 'vision_model'):
+        # 1. 检查CLIP_BaseNet结构: model.model.vision_model.clip_vision_model.encoder.layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'vision_model'):
+            vision_model = getattr(self.model.model, 'vision_model', None)
+            if vision_model is not None and hasattr(vision_model, 'clip_vision_model'):
+                clip_vision_model = getattr(vision_model, 'clip_vision_model', None)
+                if clip_vision_model is not None and hasattr(clip_vision_model, 'encoder'):
+                    encoder = getattr(clip_vision_model, 'encoder', None)
+                    if encoder is not None and hasattr(encoder, 'layers'):
+                        encoder_layers = getattr(encoder, 'layers', None)
+        
+        # 2. 检查直接的CLIP模型结构: model.vision_model.encoder.layers
+        if encoder_layers is None and hasattr(self.model, 'vision_model'):
             vision_model = getattr(self.model, 'vision_model', None)
             if vision_model is not None and hasattr(vision_model, 'encoder'):
                 encoder = getattr(vision_model, 'encoder', None)
                 if encoder is not None and hasattr(encoder, 'layers'):
                     encoder_layers = getattr(encoder, 'layers', None)
-        elif hasattr(self.model, 'model') and hasattr(self.model.model, 'vision_model'):
+        
+        # 3. 检查SGPLoRACLIPVisionTransformer结构: model.clip_vision_model.encoder.layers
+        if encoder_layers is None and hasattr(self.model, 'clip_vision_model'):
+            vision_model = getattr(self.model, 'clip_vision_model', None)
+            if vision_model is not None and hasattr(vision_model, 'encoder'):
+                encoder = getattr(vision_model, 'encoder', None)
+                if encoder is not None and hasattr(encoder, 'layers'):
+                    encoder_layers = getattr(encoder, 'layers', None)
+        
+        # 4. 检查嵌套结构: model.model.clip_vision_model.encoder.layers
+        if encoder_layers is None and hasattr(self.model, 'model') and hasattr(self.model.model, 'clip_vision_model'):
+            clip_vision_model = getattr(self.model.model, 'clip_vision_model', None)
+            if clip_vision_model is not None and hasattr(clip_vision_model, 'encoder'):
+                encoder = getattr(clip_vision_model, 'encoder', None)
+                if encoder is not None and hasattr(encoder, 'layers'):
+                    encoder_layers = getattr(encoder, 'layers', None)
+        
+        # 5. 检查CLIP_BaseNet结构: model.model.vision_model.encoder.layers (SGPLoRA情况)
+        if encoder_layers is None and hasattr(self.model, 'model') and hasattr(self.model.model, 'vision_model'):
             vision_model = getattr(self.model.model, 'vision_model', None)
             if vision_model is not None and hasattr(vision_model, 'encoder'):
                 encoder = getattr(vision_model, 'encoder', None)
                 if encoder is not None and hasattr(encoder, 'layers'):
                     encoder_layers = getattr(encoder, 'layers', None)
         
-        if encoder_layers is None:
-            # 如果都找不到，尝试直接在model中查找
-            if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layers'):
-                encoder_layers = self.model.encoder.layers
+        # 6. 如果都找不到，尝试直接在model中查找
+        if encoder_layers is None and hasattr(self.model, 'encoder'):
+            encoder = getattr(self.model, 'encoder', None)
+            if encoder is not None and hasattr(encoder, 'layers'):
+                encoder_layers = getattr(encoder, 'layers', None)
+        
+        # 7. 最后尝试，检查是否是SGPLoRACLIPVisionTransformer本身
+        if encoder_layers is None and hasattr(self.model, 'clip_vision_model'):
+            clip_vision_model = getattr(self.model, 'clip_vision_model', None)
+            if clip_vision_model is not None and hasattr(clip_vision_model, 'encoder'):
+                encoder = getattr(clip_vision_model, 'encoder', None)
+                if encoder is not None and hasattr(encoder, 'layers'):
+                    encoder_layers = getattr(encoder, 'layers', None)
         
         if encoder_layers is None:
-            raise ValueError(f"无法找到transformer编码器层，模型属性: {[attr for attr in dir(self.model) if not attr.startswith('_')]}")
+            # 打印更详细的模型结构信息用于调试
+            model_info = {}
+            for attr_name in dir(self.model):
+                if not attr_name.startswith('_'):
+                    try:
+                        attr = getattr(self.model, attr_name)
+                        if hasattr(attr, '__class__'):
+                            model_info[attr_name] = attr.__class__.__name__
+                    except:
+                        pass
+            
+            raise ValueError(f"无法找到transformer编码器层，模型结构: {model_info}")
             
         # 确定要钩住的层
         try:

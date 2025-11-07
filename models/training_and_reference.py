@@ -105,6 +105,16 @@ class TrainingAndReferenceManager:
             
     def setup_layerwise_collectors(self, teacher_network, student_network):
         """设置layer-wise特征收集器"""
+        logging.info(f"尝试设置layer-wise特征收集器，layerwise_kd_enabled: {self.layerwise_kd_enabled}")
+        logging.info(f"layerwise_kd_weight: {self.layerwise_kd_weight}")
+        logging.info(f"layerwise_kd_pooling: {self.layerwise_kd_pooling}")
+        logging.info(f"layerwise_kd_loss_type: {self.layerwise_kd_loss_type}")
+        logging.info(f"layerwise_kd_weight_strategy: {self.layerwise_kd_weight_strategy}")
+        
+        # 确保特征收集器初始化为None
+        self.teacher_feature_collector = None
+        self.student_feature_collector = None
+        
         if self.layerwise_kd_enabled:
             try:
                 self.teacher_feature_collector = LayerwiseFeatureCollector(
@@ -118,9 +128,15 @@ class TrainingAndReferenceManager:
                     self.layerwise_kd_pooling
                 )
                 logging.info(f"Layer-wise特征蒸馏已启用，池化方式: {self.layerwise_kd_pooling}")
+                logging.info(f"教师特征收集器: {self.teacher_feature_collector is not None}")
+                logging.info(f"学生特征收集器: {self.student_feature_collector is not None}")
             except Exception as e:
                 logging.warning(f"无法初始化layer-wise特征收集器: {e}")
                 self.layerwise_kd_enabled = False
+                self.teacher_feature_collector = None
+                self.student_feature_collector = None
+        else:
+            logging.info("Layer-wise特征蒸馏未启用，跳过特征收集器设置")
     
     def configure_optimizer(
         self,
@@ -416,6 +432,7 @@ class TrainingAndReferenceManager:
             "ref_feature_l2": 0.0,
             "ref_feature_cosine": 0.0,
             "ref_raw_kl": 0.0,
+            "layerwise_kd_loss": 0.0,  # 添加layerwise蒸馏损失的初始化
             "teacher_ref_probs_min": 0.0,
             "teacher_ref_probs_max": 0.0,
             "student_ref_probs_min": 0.0,
@@ -561,6 +578,7 @@ class TrainingAndReferenceManager:
             "ref_feature_l2": 0.0,
             "ref_feature_cosine": 0.0,
             "ref_raw_kl": 0.0,
+            "layerwise_kd_loss": 0.0,  # 添加layerwise蒸馏损失的初始化
             "teacher_ref_probs_min": 0.0,
             "teacher_ref_probs_max": 0.0,
             "student_ref_probs_min": 0.0,
@@ -586,6 +604,10 @@ class TrainingAndReferenceManager:
         if reference_labels is None:
             logging.debug("参考损失计算跳过: reference_labels is None")
             return zero, metrics
+            
+        # 检查layerwise蒸馏是否应该计算（即使其他条件满足，layerwise蒸馏可能单独计算）
+        if self.layerwise_kd_enabled and self.teacher_feature_collector and self.student_feature_collector:
+            logging.debug("[DEBUG] Layer-wise蒸馏条件满足，将计算layerwise损失")
 
         # 1) 教师特征：图像 -> 教师网络
         with torch.no_grad():
@@ -643,13 +665,31 @@ class TrainingAndReferenceManager:
 
         # 计算layer-wise特征蒸馏损失
         layerwise_kd_loss = torch.tensor(0.0, device=self.device)
-        if self.layerwise_kd_enabled and self.teacher_feature_collector and self.student_feature_collector:
+        logging.debug(f"[DEBUG] Layer-wise蒸馏检查 - enabled: {self.layerwise_kd_enabled}, teacher_collector: {self.teacher_feature_collector is not None}, student_collector: {self.student_feature_collector is not None}")
+        
+        # 检查特征收集器是否存在，避免调用None对象的方法
+        if self.teacher_feature_collector is None or self.student_feature_collector is None:
+            logging.warning("特征收集器未初始化，跳过layerwise蒸馏")
+            layerwise_kd_loss = torch.tensor(0.0, device=self.device)
+        elif self.layerwise_kd_enabled and self.teacher_feature_collector and self.student_feature_collector:
             try:
+                # 在教师和学生模型前向传播后立即获取特征
+                # 教师特征：重新运行教师模型以捕获中间层特征
+                with torch.no_grad():
+                    with autocast('cuda', **self._autocast_kwargs):
+                        _ = self.teacher_network.encode_image(reference_images.to(self.device, non_blocking=True))
+                
+                # 学生特征：重新运行学生模型以捕获中间层特征
+                with autocast('cuda', **self._autocast_kwargs):
+                    _ = self.network.encode_image(reference_images.to(self.device, non_blocking=True))
+                
                 # 获取教师和学生的多层特征
                 teacher_layer_features = self.teacher_feature_collector.get_layer_features_list()
                 student_layer_features = self.student_feature_collector.get_layer_features_list()
                 
-                if teacher_layer_features and student_layer_features:
+                logging.debug(f"[DEBUG] 获取到的特征 - teacher_layers: {len(teacher_layer_features)}, student_layers: {len(student_layer_features)}")
+                
+                if teacher_layer_features and student_layer_features and len(teacher_layer_features) > 0 and len(student_layer_features) > 0:
                     # 创建层权重
                     layer_weights = create_layer_weights(
                         len(teacher_layer_features),
@@ -664,13 +704,19 @@ class TrainingAndReferenceManager:
                         self.layerwise_kd_loss_type
                     )
                     
+                    logging.info(f"[INFO] Layer-wise蒸馏损失计算成功: {layerwise_kd_loss.item():.6f}")
+                    
                     # 清空特征缓存
                     self.teacher_feature_collector.clear_features()
                     self.student_feature_collector.clear_features()
+                else:
+                    logging.warning(f"[WARNING] 教师或学生特征为空，跳过layerwise蒸馏损失计算 - teacher: {len(teacher_layer_features) if teacher_layer_features else 0}, student: {len(student_layer_features) if student_layer_features else 0}")
                     
             except Exception as e:
                 logging.warning(f"Layer-wise蒸馏损失计算失败: {e}")
                 layerwise_kd_loss = torch.tensor(0.0, device=self.device)
+        else:
+            logging.debug("[DEBUG] Layer-wise蒸馏条件不满足，跳过计算")
 
         # 总KD损失 = 原有特征损失 + layer-wise特征损失 + KL损失
         kd_term = ref_feature_l2_dist + self.layerwise_kd_weight * layerwise_kd_loss + 2.0 * ref_raw_kl
@@ -746,6 +792,9 @@ class TrainingAndReferenceManager:
                     monitor_ema["ref_feature_cosine"].update(kd_metrics["ref_feature_cosine"])
                 if "ref_raw_kl" in kd_metrics:
                     monitor_ema["ref_raw_kl"].update(kd_metrics["ref_raw_kl"])
+                # 添加layerwise蒸馏损失的监控更新
+                if "layerwise_kd_loss" in kd_metrics:
+                    monitor_ema["layerwise_kd_loss"].update(kd_metrics["layerwise_kd_loss"])
 
             effective_batch_size = metrics.batch_size if metrics.batch_size > 0 else inputs.size(0)
             accuracy = metrics.correct / effective_batch_size if effective_batch_size else 0.0
@@ -786,6 +835,15 @@ class TrainingAndReferenceManager:
             history["iteration"].append(iteration)
             history["train_loss"].append(metrics.loss)
             history["lr"].append(current_lr)
+            
+            # 记录layerwise蒸馏损失到历史记录
+            if "layerwise_kd_loss" in history and self.layerwise_kd_enabled:
+                if "layerwise_kd_loss" in kd_metrics:
+                    history["layerwise_kd_loss"].append(kd_metrics["layerwise_kd_loss"])
+                else:
+                    history["layerwise_kd_loss"].append(0.0)
+            elif "layerwise_kd_loss" in history:
+                history["layerwise_kd_loss"].append(0.0)
 
             if iteration % log_interval == 0:
                 self._log_iteration(iteration, current_lr, monitor_ema, cur_task)
@@ -804,7 +862,7 @@ class TrainingAndReferenceManager:
         """Emit a structured log message for important training iterations."""
 
         logging.info(
-            "Task %d Iter %d/%d | lr=%.6g | acc=%.4f | pos_cos=%.6f | neg_cos=%.6f | ref_L2=%.6f | ref_cos=%.6f | ref_KL=%.6f",
+            "Task %d Iter %d/%d | lr=%.6g | acc=%.4f | pos_cos=%.6f | neg_cos=%.6f | ref_L2=%.6f | ref_cos=%.6f | ref_KL=%.6f | layerwise_KD=%.6f",
             cur_task,
             iteration,
             self.iterations,
@@ -815,4 +873,5 @@ class TrainingAndReferenceManager:
             monitor_ema["ref_feature_l2"].get(),
             monitor_ema["ref_feature_cosine"].get(),
             monitor_ema["ref_raw_kl"].get(),
+            monitor_ema['layerwise_kd_loss'].get()
         )
