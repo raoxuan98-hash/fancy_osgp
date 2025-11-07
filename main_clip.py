@@ -2,7 +2,6 @@ import argparse
 import os
 from trainer_clip import train
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "4"
 
 # --------------------------------------------------------------
 # 2️⃣  主入口
@@ -48,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     # LoRA
     # ------------------------------------------------------------------
     model.add_argument('--lora_rank', type=int, default=8, help='LoRA rank.')
-    model.add_argument('--lora_type', type=str, default="nsp_lora", choices=['basic_lora', 'sgp_lora', 'nsp_lora', 'full'], help='Type of LoRA adaptor.')
+    model.add_argument('--lora_type', type=str, default="sgp_lora", choices=['basic_lora', 'sgp_lora', 'nsp_lora', 'full'], help='Type of LoRA adaptor.')
 
 
     # NSP相关的参数
@@ -56,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument('--nsp_weight', type=float, default=0.02, choices=[0.0, 0.02, 0.05])
     
     # SGP相关的参数
-    model.add_argument('--weight_temp', type=float, default=1, help='Projection temperature.')
+    model.add_argument('--weight_temp', type=float, default=0.1, help='Projection temperature.')
     model.add_argument('--weight_kind', type=str, default='log1p', choices=["exp", "log1p", "rational1", "rational2", "sqrt_rational2", "power_family", "stretched_exp"])
     model.add_argument('--weight_p', type=float, default=1.0, help='Weight p.')
 
@@ -66,14 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
     train_grp.add_argument('--warmup_steps', type=int, default=0, help='Warm‑up steps.')
     train_grp.add_argument('--optimizer', type=str, default='adamw', help='Optimizer name (adamw / sgd).')
     train_grp.add_argument('--lrate', type=float, default=5e-4, help='Learning rate.')
-    train_grp.add_argument('--batch_size', type=int, default=16, help='Batch size.')
+    train_grp.add_argument('--batch_size', type=int, default=24, help='Batch size.')
     train_grp.add_argument('--gamma_norm', type=float, default=0.1, help='Norm regularisation weight.')
     train_grp.add_argument('--gamma_kd', type=float, default=5.0, help='Knowledge‑distillation weight.')
     train_grp.add_argument('--kd_type', type=str, default='feat', help='KD type (feat / logit).')
-    train_grp.add_argument('--kl_gamma', type=float, default=1.0, help='KL divergence regularisation weight.')
-    train_grp.add_argument('--bidirectional_kd', type=bool, default=True, help='Enable bidirectional KL divergence for knowledge distillation.')
+    train_grp.add_argument('--kl_gamma', type=float, default=5.0, help='KL divergence regularisation weight.')
+    train_grp.add_argument('--bidirectional_kd', type=bool, default=False, help='Enable bidirectional KL divergence for knowledge distillation.')
     train_grp.add_argument('--layerwise_kd_enabled', type=bool, default=True, help='Enable layer-wise feature distillation.')
-    train_grp.add_argument('--layerwise_kd_weight', type=float, default=1.0, help='Weight for layer-wise feature distillation.')
+    train_grp.add_argument('--layerwise_kd_weight', type=float, default=5.0, help='Weight for layer-wise feature distillation.')
     train_grp.add_argument('--layerwise_kd_pooling', type=str, default='mean', choices=['mean', 'cls', 'max'], help='Pooling method for layer-wise features.')
     train_grp.add_argument('--layerwise_kd_loss_type', type=str, default='mse', choices=['mse', 'cosine', 'mse_cosine'], help='Loss type for layer-wise distillation.')
     train_grp.add_argument('--layerwise_kd_weight_strategy', type=str, default='uniform', choices=['uniform', 'linear', 'exponential'], help='Weight strategy for different layers.')
@@ -103,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     aux.add_argument('--aux_type_hint', type=str, default=None, choices=['imagenet', 'flickr8k'], help='Optional hint for automatic dataset type detection.')
     aux.add_argument('--aux_num_samples', type=int, default=1024, help='Limit the number of samples from the reference dataset. If not specified, use all samples.')
     aux.add_argument('--aux_split', type=str, default='val', choices=['train', 'val'], help='Dataset split to use (for datasets that support multiple splits like ImageNet).')
-    aux.add_argument('--reference_batch_size', type=int, default=16, help='Batch size for the reference dataset. If not specified, uses the same value as the main training batch size.')
+    aux.add_argument('--reference_batch_size', type=int, default=24, help='Batch size for the reference dataset. If not specified, uses the same value as the main training batch size.')
 
     # ------------------------------------------------------------------
     # 正则化 / L2‑Protection
@@ -116,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
 # In[]
 if __name__ == '__main__':
     import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = "4"
+    os.environ['CUDA_VISIBLE_DEVICES'] = "5"
     parser = build_parser()
     args = parser.parse_args()
     args = vars(args)

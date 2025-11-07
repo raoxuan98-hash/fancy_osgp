@@ -21,12 +21,12 @@ class FeatureHook:
             input: 输入张量
             output: 输出张量，形状为 [batch_size, seq_len, feature_dim]
         """
-        # 确保输出是张量并分离计算图
+        # 确保输出是张量并保持梯度流
         if isinstance(output, torch.Tensor):
-            self.features = output.detach()
+            self.features = output.clone()  # 使用clone()而不是detach()来保持梯度流
         elif isinstance(output, tuple):
             # 有些层可能返回多个输出，取第一个
-            self.features = output[0].detach() if output[0] is not None else None
+            self.features = output[0].clone() if output[0] is not None else None  # 使用clone()而不是detach()
         
     def get_pooled_features(self, pooling_type: str = 'mean') -> Optional[torch.Tensor]:
         """
@@ -142,19 +142,9 @@ class LayerwiseFeatureCollector:
                 if encoder is not None and hasattr(encoder, 'layers'):
                     encoder_layers = getattr(encoder, 'layers', None)
         
-        if encoder_layers is None:
-            # 打印更详细的模型结构信息用于调试
-            model_info = {}
-            for attr_name in dir(self.model):
-                if not attr_name.startswith('_'):
-                    try:
-                        attr = getattr(self.model, attr_name)
-                        if hasattr(attr, '__class__'):
-                            model_info[attr_name] = attr.__class__.__name__
-                    except:
-                        pass
-            
-            raise ValueError(f"无法找到transformer编码器层，模型结构: {model_info}")
+        # 8. 新增：检查是否是简单的transformer模型（用于测试）
+        if encoder_layers is None and hasattr(self.model, 'layers'):
+            encoder_layers = getattr(self.model, 'layers', None)
             
         # 确定要钩住的层
         try:
@@ -252,8 +242,7 @@ def layerwise_feature_distillation_loss(
     if len(layer_weights) != len(teacher_features):
         raise ValueError(f"层权重数量与特征数量不匹配: {len(layer_weights)} vs {len(teacher_features)}")
         
-    total_loss = 0.0
-    device = student_features[0].device if student_features else teacher_features[0].device
+    total_loss = torch.tensor(0.0, device=student_features[0].device if student_features else teacher_features[0].device)
     
     for t_feat, s_feat, weight in zip(teacher_features, student_features, layer_weights):
         if loss_type == 'mse':
@@ -271,8 +260,7 @@ def layerwise_feature_distillation_loss(
             
         total_loss += weight * layer_loss
         
-    return torch.tensor(total_loss / len(teacher_features),
-                      device=student_features[0].device if student_features else 'cpu')
+    return total_loss / len(teacher_features)
 
 
 def create_layer_weights(

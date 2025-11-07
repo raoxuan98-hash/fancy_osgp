@@ -1,0 +1,117 @@
+[
+  {
+    "index": 0,
+    "parameters": {
+      "bidirectional_kd": false,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "linear",
+      "lrate": 0.0001
+    },
+    "value": 0.5395866127928748,
+    "duration_sec": 1.0011084680445492,
+    "failed": false,
+    "error_message": null,
+    "optimized_params": {
+      "bidirectional_kd": false,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "linear",
+      "lrate": 0.0001
+    }
+  },
+  {
+    "index": 1,
+    "parameters": {
+      "bidirectional_kd": true,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "uniform",
+      "lrate": 0.0005
+    },
+    "value": 0.5466192091521856,
+    "duration_sec": 1.0010932069271803,
+    "failed": false,
+    "error_message": null,
+    "optimized_params": {
+      "bidirectional_kd": true,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "uniform",
+      "lrate": 0.0005
+    }
+  },
+  {
+    "index": 2,
+    "parameters": {
+      "bidirectional_kd": true,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 0.1,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "uniform",
+      "lrate": 0.0001
+    },
+    "value": 0.52536873708223,
+    "duration_sec": 1.001046746969223,
+    "failed": false,
+    "error_message": null,
+    "optimized_params": {
+      "bidirectional_kd": true,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 0.1,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "uniform",
+      "lrate": 0.0001
+    }
+  },
+  {
+    "index": 3,
+    "parameters": {
+      "bidirectional_kd": false,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "mse",
+      "layerwise_kd_weight_strategy": "linear",
+      "lrate": 0.0005
+    },
+    "value": 0.5289982526071945,
+    "duration_sec": 1.0010727930348366,
+    "failed": false,
+    "error_message": null,
+    "optimized_params": {
+      "bidirectional_kd": false,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "mse",
+      "layerwise_kd_weight_strategy": "linear",
+      "lrate": 0.0005
+    }
+  },
+  {
+    "index": 4,
+    "parameters": {
+      "bidirectional_kd": true,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "uniform",
+      "lrate": 0.0001
+    },
+    "value": 0.5542841466907149,
+    "duration_sec": 1.001072830054909,
+    "failed": false,
+    "error_message": null,
+    "optimized_params": {
+      "bidirectional_kd": true,
+      "layerwise_kd_enabled": true,
+      "layerwise_kd_weight": 1.0,
+      "layerwise_kd_loss_type": "cosine",
+      "layerwise_kd_weight_strategy": "uniform",
+      "lrate": 0.0001
+    }
+  }
+]

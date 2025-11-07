@@ -669,7 +669,7 @@ class TrainingAndReferenceManager:
         
         # 检查特征收集器是否存在，避免调用None对象的方法
         if self.teacher_feature_collector is None or self.student_feature_collector is None:
-            logging.warning("特征收集器未初始化，跳过layerwise蒸馏")
+            # logging.warning("特征收集器未初始化，跳过layerwise蒸馏")
             layerwise_kd_loss = torch.tensor(0.0, device=self.device)
         elif self.layerwise_kd_enabled and self.teacher_feature_collector and self.student_feature_collector:
             try:
