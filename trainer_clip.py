@@ -30,8 +30,10 @@ def train(args):
         args['device'] = device
         logfile_head, logfile_name = build_log_dirs(args)
         args['log_path'] = logfile_name
+        # 根据参数设置日志级别
+        log_level = logging.DEBUG if args.get('debug_mode', False) else logging.INFO
         logging.basicConfig(
-            level=logging.INFO,
+            level=log_level,
             format='%(asctime)s [%(filename)s] => %(message)s',
             handlers=[
                 logging.FileHandler(filename=os.path.join(logfile_name, 'record.log')),

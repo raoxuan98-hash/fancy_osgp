@@ -13,10 +13,45 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, _LRScheduler
 
 from models.config import OptimizationConfig, ReferenceBatch, TrainingStepMetrics
 from models.subspace_utils import EMASmooth
+from models.layerwise_distillation import LayerwiseFeatureCollector, layerwise_feature_distillation_loss, create_layer_weights
 
 def feature_distillation_loss(
     teacher_feat: torch.Tensor, student_feat: torch.Tensor) -> torch.Tensor:
     return ((teacher_feat - student_feat) ** 2).mean()
+
+def bidirectional_kl_loss(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    temperature: float = 2.0
+) -> torch.Tensor:
+    """
+    计算双向KL散度损失，结合mode-covering和mode-seeking
+    
+    Args:
+        teacher_logits: 教师模型的logits
+        student_logits: 学生模型的logits
+        temperature: 温度参数
+        
+    Returns:
+        双向KL散度损失: 0.5 * KL(p_t || p_s) + 0.5 * KL(p_s || p_t)
+    """
+    # 计算概率分布
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+    student_probs = F.softmax(student_logits / temperature, dim=-1)
+    
+    # 计算KL(p_t || p_s) - mode covering
+    log_student_probs = F.log_softmax(student_logits / temperature, dim=-1)
+    kl_teacher_to_student = F.kl_div(log_student_probs, teacher_probs, reduction="batchmean")
+    
+    # 计算KL(p_s || p_t) - mode seeking
+    log_teacher_probs = F.log_softmax(teacher_logits / temperature, dim=-1)
+    kl_student_to_teacher = F.kl_div(log_teacher_probs, student_probs, reduction="batchmean")
+    
+    # 双向KL散度，平均权重
+    bidirectional_kl = 0.5 * kl_teacher_to_student + 0.5 * kl_student_to_teacher
+    
+    # 温度缩放
+    return bidirectional_kl * (temperature * temperature)
 
 class TrainingManager:
     """Manages the training loop and optimization for SubspaceLoRA CLIP."""
@@ -47,10 +82,46 @@ class TrainingManager:
         self.gamma_prior = reg_cfg.gamma_prior
         self.l2_protection = reg_cfg.l2_enabled
         self.l2_lambda = reg_cfg.l2_lambda
+        self.bidirectional_kd = reg_cfg.bidirectional_kd
+        
+        # Layer-wise特征蒸馏配置
+        self.layerwise_kd_enabled = reg_cfg.layerwise_kd_enabled
+        self.layerwise_kd_weight = reg_cfg.layerwise_kd_weight
+        self.layerwise_kd_layers = reg_cfg.layerwise_kd_layers
+        self.layerwise_kd_pooling = reg_cfg.layerwise_kd_pooling
+        self.layerwise_kd_loss_type = reg_cfg.layerwise_kd_loss_type
+        self.layerwise_kd_weight_strategy = reg_cfg.layerwise_kd_weight_strategy
+        
+        # 初始化特征收集器（稍后设置）
+        self.teacher_feature_collector = None
+        self.student_feature_collector = None
         
         # State
         self.prev_params: Optional[Dict[str, torch.Tensor]] = None
         self._last_valid_batch_size: int = 0
+        
+        # 只有在启用layer-wise蒸馏时才初始化特征收集器
+        self.teacher_feature_collector = None
+        self.student_feature_collector = None
+            
+    def setup_layerwise_collectors(self, teacher_network, student_network):
+        """设置layer-wise特征收集器"""
+        if self.layerwise_kd_enabled:
+            try:
+                self.teacher_feature_collector = LayerwiseFeatureCollector(
+                    teacher_network,
+                    self.layerwise_kd_layers,
+                    self.layerwise_kd_pooling
+                )
+                self.student_feature_collector = LayerwiseFeatureCollector(
+                    student_network,
+                    self.layerwise_kd_layers,
+                    self.layerwise_kd_pooling
+                )
+                logging.info(f"Layer-wise特征蒸馏已启用，池化方式: {self.layerwise_kd_pooling}")
+            except Exception as e:
+                logging.warning(f"无法初始化layer-wise特征收集器: {e}")
+                self.layerwise_kd_enabled = False
         
     def configure_optimizer(
         self,
@@ -205,7 +276,7 @@ class TrainingManager:
         self._last_valid_batch_size = batch_size
         return TrainingStepMetrics(
             loss=float(loss.detach().cpu().item()),
-            correct=n_correct,
+            correct=int(n_correct),
             kd_value=float((kd_term + l2_term).detach().cpu().item()),
             prior_value=float(prior_term.detach().cpu().item()) if isinstance(prior_term, torch.Tensor) else float(prior_term),
             batch_size=batch_size,
@@ -315,16 +386,54 @@ class TrainingManager:
         prob_student_ref = F.softmax(student_logits_ref, dim=-1)
 
         temperature = 2.0
-        teacher_probs = F.softmax(teacher_logits_ref / temperature, dim=-1).detach()
-        student_log_probs = F.log_softmax(student_logits_ref / temperature, dim=-1)
-        ref_raw_kl = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature * temperature)
+        if self.bidirectional_kd:
+            # 使用双向KL散度
+            ref_raw_kl = bidirectional_kl_loss(teacher_logits_ref, student_logits_ref, temperature)
+        else:
+            # 使用原有的单向KL散度
+            teacher_probs = F.softmax(teacher_logits_ref / temperature, dim=-1).detach()
+            student_log_probs = F.log_softmax(student_logits_ref / temperature, dim=-1)
+            ref_raw_kl = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature * temperature)
 
-        kd_term = ref_feature_l2_dist + 2.0 * ref_raw_kl
+        # 计算layer-wise特征蒸馏损失
+        layerwise_kd_loss = torch.tensor(0.0, device=self.device)
+        if self.layerwise_kd_enabled and self.teacher_feature_collector and self.student_feature_collector:
+            try:
+                # 获取教师和学生的多层特征
+                teacher_layer_features = self.teacher_feature_collector.get_layer_features_list()
+                student_layer_features = self.student_feature_collector.get_layer_features_list()
+                
+                if teacher_layer_features and student_layer_features:
+                    # 创建层权重
+                    layer_weights = create_layer_weights(
+                        len(teacher_layer_features),
+                        self.layerwise_kd_weight_strategy
+                    )
+                    
+                    # 计算layer-wise蒸馏损失
+                    layerwise_kd_loss = layerwise_feature_distillation_loss(
+                        teacher_layer_features,
+                        student_layer_features,
+                        layer_weights,
+                        self.layerwise_kd_loss_type
+                    )
+                    
+                    # 清空特征缓存
+                    self.teacher_feature_collector.clear_features()
+                    self.student_feature_collector.clear_features()
+                    
+            except Exception as e:
+                logging.warning(f"Layer-wise蒸馏损失计算失败: {e}")
+                layerwise_kd_loss = torch.tensor(0.0, device=self.device)
+
+        # 总KD损失 = 原有特征损失 + layer-wise特征损失 + KL损失
+        kd_term = ref_feature_l2_dist + self.layerwise_kd_weight * layerwise_kd_loss + 2.0 * ref_raw_kl
 
         metrics.update(
             ref_feature_l2=float(ref_feature_l2_dist.item()),
             ref_feature_cosine=float(ref_feature_cosine_sim.item()),
             ref_raw_kl=float(ref_raw_kl.item()),
+            layerwise_kd_loss=float(layerwise_kd_loss.item()),
             teacher_ref_probs_min=float(prob_teacher_ref.min().item()),
             teacher_ref_probs_max=float(prob_teacher_ref.max().item()),
             student_ref_probs_min=float(prob_student_ref.min().item()),

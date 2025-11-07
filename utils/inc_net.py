@@ -15,7 +15,7 @@ def get_clip_model(args, train_mode="lora"):
     train_mode: "lora" | "full" | "frozen"
     """
     model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16", use_fast=False)
 
     if train_mode == "frozen":
         for p in model.parameters():

@@ -2,6 +2,7 @@ import argparse
 import os
 from trainer_clip import train
 
+os.environ['CUDA_VISIBLE_DEVICES'] = "4"
 
 # --------------------------------------------------------------
 # 2️⃣  主入口
@@ -65,14 +66,21 @@ def build_parser() -> argparse.ArgumentParser:
     train_grp.add_argument('--warmup_steps', type=int, default=0, help='Warm‑up steps.')
     train_grp.add_argument('--optimizer', type=str, default='adamw', help='Optimizer name (adamw / sgd).')
     train_grp.add_argument('--lrate', type=float, default=5e-4, help='Learning rate.')
-    train_grp.add_argument('--batch_size', type=int, default=32, help='Batch size.')
+    train_grp.add_argument('--batch_size', type=int, default=16, help='Batch size.')
     train_grp.add_argument('--gamma_norm', type=float, default=0.1, help='Norm regularisation weight.')
     train_grp.add_argument('--gamma_kd', type=float, default=5.0, help='Knowledge‑distillation weight.')
     train_grp.add_argument('--kd_type', type=str, default='feat', help='KD type (feat / logit).')
     train_grp.add_argument('--kl_gamma', type=float, default=1.0, help='KL divergence regularisation weight.')
+    train_grp.add_argument('--bidirectional_kd', action='store_true', default=False, help='Enable bidirectional KL divergence for knowledge distillation.')
+    train_grp.add_argument('--layerwise_kd_enabled', action='store_true', default=False, help='Enable layer-wise feature distillation.')
+    train_grp.add_argument('--layerwise_kd_weight', type=float, default=1.0, help='Weight for layer-wise feature distillation.')
+    train_grp.add_argument('--layerwise_kd_pooling', type=str, default='mean', choices=['mean', 'cls', 'max'], help='Pooling method for layer-wise features.')
+    train_grp.add_argument('--layerwise_kd_loss_type', type=str, default='mse', choices=['mse', 'cosine', 'mse_cosine'], help='Loss type for layer-wise distillation.')
+    train_grp.add_argument('--layerwise_kd_weight_strategy', type=str, default='uniform', choices=['uniform', 'linear', 'exponential'], help='Weight strategy for different layers.')
     train_grp.add_argument('--compensate', type=bool, default=True)
     train_grp.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True, help='Enable torch.cuda.amp mixed precision when CUDA is available.')
     train_grp.add_argument('--amp_dtype', type=str, default='fp16', choices=['fp16', 'bf16'], help='AMP compute dtype to request when mixed precision is enabled.')
+    train_grp.add_argument('--debug_mode', action=argparse.BooleanOptionalAction, default=False, help='Enable debug mode to show detailed debug logs.')
 
     # ------------------------------------------------------------------
     # CLIP dataset sequence
@@ -90,7 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     # ------------------------------------------------------------------
     aux = parser.add_argument_group('auxiliary', 'External / auxiliary dataset')
     aux.add_argument('--auxiliary_data_path', type=str, default='/data1/open_datasets/flickr8k', help='Root path of the auxiliary dataset. Example for Flickr8k: D:/projects/datasets/flickr8k')
-    aux.add_argument('--aux_dataset_type', type=str, default='flickr8k', choices=['imagenet', 'flickr8k'], help='Dataset type for auxiliary data (imagenet or flickr8k).')
+    aux.add_argument('--aux_dataset_type', type=str, default='flickr8k', choices=['imagenet', 'flickr8k', 'auto'], help='Dataset type for auxiliary data (imagenet, flickr8k, or auto for automatic detection).')
+    aux.add_argument('--aux_auto_detect', action=argparse.BooleanOptionalAction, default=True, help='Enable automatic dataset type detection based on path keywords and directory structure.')
+    aux.add_argument('--aux_type_hint', type=str, default=None, choices=['imagenet', 'flickr8k'], help='Optional hint for automatic dataset type detection.')
+    aux.add_argument('--aux_num_samples', type=int, default=1024, help='Limit the number of samples from the reference dataset. If not specified, use all samples.')
+    aux.add_argument('--aux_split', type=str, default='val', choices=['train', 'val'], help='Dataset split to use (for datasets that support multiple splits like ImageNet).')
+    aux.add_argument('--reference_batch_size', type=int, default=16, help='Batch size for the reference dataset. If not specified, uses the same value as the main training batch size.')
 
     # ------------------------------------------------------------------
     # 正则化 / L2‑Protection

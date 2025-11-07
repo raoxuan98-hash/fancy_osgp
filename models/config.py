@@ -40,6 +40,14 @@ class RegularizationConfig:
     gamma_prior: float
     l2_enabled: bool
     l2_lambda: float
+    bidirectional_kd: bool = False  # 控制是否使用双向KL散度进行知识蒸馏
+    # Layer-wise特征蒸馏配置
+    layerwise_kd_enabled: bool = False  # 是否启用layer-wise特征蒸馏
+    layerwise_kd_weight: float = 1.0  # layer-wise蒸馏的权重
+    layerwise_kd_layers: Optional[List[int]] = None  # 指定要蒸馏的层，None表示所有层
+    layerwise_kd_pooling: str = "mean"  # 池化方式："mean", "cls", "max"
+    layerwise_kd_loss_type: str = "mse"  # 损失类型："mse", "cosine", "mse_cosine"
+    layerwise_kd_weight_strategy: str = "uniform"  # 层权重策略："uniform", "linear", "exponential"
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,11 @@ class ReferenceConfig:
     batch_size: int
     num_workers: int
     pin_memory: bool
+    # 新增配置选项
+    auto_detect: bool = False  # 是否启用自动数据集类型检测
+    type_hint: Optional[str] = None  # 数据集类型提示，用于辅助自动检测
+    num_samples: Optional[int] = None  # 限制数据集样本数量，None表示使用全部样本
+    split: str = "val"  # 数据集分割，对于ImageNet等数据集有效，可选"train"或"val"
 
 
 @dataclass

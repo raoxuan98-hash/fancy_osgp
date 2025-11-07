@@ -107,6 +107,9 @@ class SubspaceLoRAClipLearner(BaseLearner):
             self.reference_cfg, self.use_amp, self.amp_dtype, self._autocast_kwargs,
             self.clip_num_workers, self.clip_pin_memory
         )
+        
+        # 设置layer-wise特征收集器
+        self.training_ref_manager.setup_layerwise_collectors(self.teacher_network, self.network)
 
         # Training configuration
         self.batch_size: int = self.loop_cfg.batch_size
@@ -136,6 +139,11 @@ class SubspaceLoRAClipLearner(BaseLearner):
         self.monitor_ema = build_metric_smoothers(self.ema_alpha)
         self.use_feature_kd: bool = self.gamma_kd > 0.0 and self.use_reference_data
         self.reference_batch_size: int = self.reference_cfg.batch_size
+        
+        # 添加调试信息
+        logging.info(f"参考数据配置 - enabled: {self.use_reference_data}")
+        logging.info(f"知识蒸馏配置 - gamma_kd: {self.gamma_kd}")
+        logging.info(f"特征知识蒸馏启用状态 - use_feature_kd: {self.use_feature_kd}")
 
         # Timing and history
         self._timings: Timing = Timing()
@@ -178,15 +186,37 @@ class SubspaceLoRAClipLearner(BaseLearner):
             gamma_prior=float(args["kl_gamma"]),
             l2_enabled=bool(args.get("l2_protection", False)),
             l2_lambda=float(args.get("l2_protection_lambda", 0.0)),
+            bidirectional_kd=bool(args.get("bidirectional_kd", False)),
+            layerwise_kd_enabled=bool(args.get("layerwise_kd_enabled", False)),
+            layerwise_kd_weight=float(args.get("layerwise_kd_weight", 1.0)),
+            layerwise_kd_layers=None,  # 可以从args中获取，目前使用None表示所有层
+            layerwise_kd_pooling=str(args.get("layerwise_kd_pooling", "mean")),
+            layerwise_kd_loss_type=str(args.get("layerwise_kd_loss_type", "mse")),
+            layerwise_kd_weight_strategy=str(args.get("layerwise_kd_weight_strategy", "uniform")),
         )
 
+        # 处理自动检测选项
+        aux_dataset_type = args.get("aux_dataset_type", "imagenet")
+        auto_detect = bool(args.get("aux_auto_detect", False))
+        
+        # 如果指定了"auto"类型，则启用自动检测
+        if aux_dataset_type.lower() == "auto":
+            auto_detect = True
+            aux_dataset_type = None  # 将由自动检测确定
+        
         reference_cfg = ReferenceConfig(
             enabled=bool(args.get("clip_use_reference_data", False)),
-            dataset_type=str(args.get("aux_dataset_type", "imagenet")).lower(),
+            dataset_type=str(aux_dataset_type).lower() if aux_dataset_type else "imagenet",
             dataset_path=args.get("auxiliary_data_path"),
             batch_size=int(args.get("reference_batch_size", args["batch_size"])),
             num_workers=int(args.get("clip_num_workers", 3)),
-            pin_memory=bool(args.get("clip_pin_memory", True)))
+            pin_memory=bool(args.get("clip_pin_memory", True)),
+            # 新增配置选项
+            auto_detect=auto_detect,
+            type_hint=args.get("aux_type_hint"),
+            num_samples=args.get("aux_num_samples"),
+            split=args.get("aux_split", "val")
+        )
         return optim_cfg, loop_cfg, reg_cfg, reference_cfg
 
     @torch.no_grad()
