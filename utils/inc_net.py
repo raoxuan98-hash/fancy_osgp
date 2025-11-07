@@ -3,58 +3,12 @@ import torch
 from torch import nn
 from copy import deepcopy
 import timm
-from lora import NullSpaceViT
-from models.basic_lora import PlainLoRAViT
-from models.sgp_lora import SGPLoRAViT, SGPLoRACLIPVisionTransformer
+from models.sgp_lora import SGPLoRACLIPVisionTransformer
 from transformers import CLIPModel, CLIPProcessor
 from torchvision import transforms
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-
-def get_vit(args, pretrained=False):
-    name = args['vit_type']
-    name = name.lower()
-    rank = args['lora_rank']
-
-    if name == 'vit-b-p16':
-        vit = timm.create_model("vit_base_patch16_224", pretrained=pretrained, num_classes=0)
-
-    elif name == 'vit-b-p16-mocov3':
-        vit = timm.create_model('vit_base_patch16_224.', pretrained=False, num_classes=0)
-        model_dict = torch.load('mocov3-vit-base-300ep.pth', weights_only=False)
-        vit.load_state_dict(model_dict['model'], strict=True)
-    
-    elif name == 'vit-b-p16-dino':
-        vit = timm.create_model('vit_base_patch16_224.dino', pretrained=pretrained, num_classes=0)
-
-    elif name == 'vit-b-p16-mae':
-        vit = timm.create_model('vit_base_patch16_224.mae', pretrained=pretrained, num_classes=0)
-
-    else:
-        raise ValueError(f'Model {name} not supported')
-    
-    vit.head = nn.Identity()
-    del vit.norm
-    vit.norm = nn.LayerNorm(768, elementwise_affine=False)
-    
-    lora_type = args['lora_type']
-    if lora_type == "full":
-        return NullSpaceViT(vit, use_projection=args['use_projection'])
-    
-    elif lora_type == "basic_lora":
-        return PlainLoRAViT(vit, r=rank)
-
-    elif lora_type == "sgp_lora":
-        return SGPLoRAViT(vit, r=rank, weight_temp=args['weight_temp'], use_soft_projection=True, weight_kind=args['weight_kind'], weight_p=args['weight_p'])
-    
-    elif lora_type == "nsp_lora":
-        return SGPLoRAViT(vit, r=rank, weight_temp=args['weight_temp'], use_soft_projection=False, nsp_eps=args['nsp_eps'], nsp_weight=args['nsp_weight'])
-
-    else:
-        raise ValueError(f"LoRA type {lora_type} not supported")
-
 
 def get_clip_model(args, train_mode="lora"):
     """
@@ -84,6 +38,7 @@ def get_clip_model(args, train_mode="lora"):
 
         if args['lora_type'] == 'nsp_lora':
             use_soft_projection = False
+        
         elif args['lora_type'] == "sgp_lora":
             use_soft_projection = True
 
@@ -103,62 +58,8 @@ def get_clip_model(args, train_mode="lora"):
         raise ValueError(f"Unsupported train_mode: {train_mode}")
 
 
-class ContinualLinear(nn.Module):
-    def __init__(self, embed_dim, nb_classes):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.heads = nn.ModuleList([nn.Linear(embed_dim, nb_classes, bias=False)])
-        self.head_weights = nn.Parameter(torch.ones(nb_classes))
-        self.current_output_size = nb_classes
-
-    def update(self, nb_classes):
-        new_head = nn.Linear(self.embed_dim, nb_classes, bias=False)
-        self.heads.append(new_head)
-        new_head_weights = nn.Parameter(torch.ones(self.current_output_size + nb_classes))
-
-        with torch.no_grad():
-            new_head_weights[:self.current_output_size] = self.head_weights
-            new_head_weights[self.current_output_size:] = 1.0
-        
-        self.head_weights = new_head_weights
-        self.current_output_size += nb_classes
-
-    def forward(self, x):
-        outputs = [head(x) for head in self.heads]
-        combined = torch.cat(outputs, dim=1)
-        return combined * self.head_weights
-
-
-class BaseNet(nn.Module):
-    def __init__(self, args, pretrained):
-        super(BaseNet, self).__init__()
-        self.vit = get_vit(args, pretrained)
-        self.fc = None
-
-    def extract_vector(self, x):
-        return self.vit(x)
-
-    def forward(self, x):
-        x = self.vit(x)
-        out = self.fc(x)
-        return out
-    
-    @property
-    def feature_dim(self):
-        return self.vit.feature_dim
-
-    def update_fc(self, nb_classes):
-        if self.fc is None:
-            self.fc = ContinualLinear(self.feature_dim, nb_classes)
-        else:
-            self.fc.update(nb_classes)
-
-    def copy(self):
-        return copy.deepcopy(self)
-
-
 class CLIP_BaseNet(nn.Module):
-    def __init__(self, args, train_mode="full"):
+    def __init__(self, args, train_mode="lora"):
         super(CLIP_BaseNet, self).__init__()
         self.train_mode = train_mode
 

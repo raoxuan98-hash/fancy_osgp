@@ -19,9 +19,9 @@ class BaseLearner(object):
         self._data_memory, self._targets_memory = np.array([]), np.array([])
         self.topk = 5
 
-        self._memory_size = args['memory_size']
-        self._memory_per_class = args['memory_per_class']
-        self._fixed_memory = args['fixed_memory']
+        self._memory_size = args.get('memory_size', 0)
+        self._memory_per_class = args.get('memory_per_class', 0)
+        self._fixed_memory = args.get('fixed_memory', False)
         self._device = args['device']
         self._init_cls = args['init_cls']
         self.task_count = 0
